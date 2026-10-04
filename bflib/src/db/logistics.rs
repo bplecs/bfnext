@@ -175,17 +175,28 @@ pub struct Transfer {
 
 impl Transfer {
     /// Apply the transfer to the db (not the DCS warehouses) and publish the
-    /// new inventory of both objectives as stats. Fails if either objective
-    /// doesn't exist.
+    /// new inventory of both objectives as stats. Fails, without changing
+    /// anything, if either objective doesn't exist.
+    ///
+    /// Transfers are computed ahead of time, and the source's stock may have
+    /// dropped since (e.g. a player took off with it, or overlapping
+    /// transfers were scheduled), so at most what the source currently holds
+    /// is moved.
     fn execute(&self, db: &mut Persisted, to_bg: &Option<UnboundedSender<Task>>) -> Result<()> {
+        // check the target first so a deleted target doesn't make the
+        // supplies vanish from the source
+        if db.objectives.get(&self.target).is_none() {
+            bail!("no such objective {:?}", self.target)
+        }
         let src = db
             .objectives
             .get_mut_cow(&self.source)
             .ok_or_else(|| anyhow!("no such objective {:?}", self.source))?;
-        match &self.item {
+        let amount = match &self.item {
             TransferItem::Equipment(name) => {
                 let d = &mut src.warehouse.equipment[name].stored;
-                *d -= self.amount;
+                let amount = min(self.amount, *d);
+                *d -= amount;
                 if let Some(to_bg) = to_bg.as_ref() {
                     let _ = to_bg.send(Task::Stat(Stat::EquipmentInventory {
                         id: src.id,
@@ -193,10 +204,12 @@ impl Transfer {
                         amount: *d,
                     }));
                 }
+                amount
             }
             TransferItem::Liquid(name) => {
                 let d = &mut src.warehouse.liquids[name].stored;
-                *d -= self.amount;
+                let amount = min(self.amount, *d);
+                *d -= amount;
                 if let Some(to_bg) = to_bg.as_ref() {
                     let _ = to_bg.send(Task::Stat(Stat::LiquidInventory {
                         id: src.id,
@@ -204,8 +217,9 @@ impl Transfer {
                         amount: *d,
                     }));
                 }
+                amount
             }
-        }
+        };
         let dst = db
             .objectives
             .get_mut_cow(&self.target)
@@ -217,7 +231,7 @@ impl Transfer {
                     .equipment
                     .get_or_default_cow(name.clone())
                     .stored;
-                *d += self.amount;
+                *d = d.saturating_add(amount);
                 if let Some(to_bg) = to_bg.as_ref() {
                     let _ = to_bg.send(Task::Stat(Stat::EquipmentInventory {
                         id: dst.id,
@@ -228,7 +242,7 @@ impl Transfer {
             }
             TransferItem::Liquid(name) => {
                 let d = &mut dst.warehouse.liquids.get_or_default_cow(*name).stored;
-                *d += self.amount;
+                *d = d.saturating_add(amount);
                 if let Some(to_bg) = to_bg.as_ref() {
                     let _ = to_bg.send(Task::Stat(Stat::LiquidInventory {
                         id: dst.id,
