@@ -11,6 +11,12 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Bindings to the DCS `Spot` scripting class: laser and infrared pointers.
+//!
+//! A [`Spot`] is created from a source object and points at a target
+//! position until it is destroyed. It is used, for example, by JTACs to
+//! designate targets.
+
 use super::{as_tbl, object::Object};
 use crate::{
     object::{DcsObject, DcsOid},
@@ -21,9 +27,13 @@ use mlua::{prelude::*, Value};
 use serde_derive::Serialize;
 use std::{marker::PhantomData, ops::Deref};
 
+// A DCS laser or infrared spot.
 wrapped_table!(Spot, Some("Spot"));
 
 impl<'lua> Spot<'lua> {
+    /// Create a laser spot from `source` pointing at `target` with laser
+    /// code `code`. `local_ref`, if given, is the beam origin relative to
+    /// the source object. Calls `Spot.createLaser`.
     pub fn create_laser(
         lua: MizLua<'lua>,
         source: Object<'lua>,
@@ -36,6 +46,9 @@ impl<'lua> Spot<'lua> {
         Ok(spot.call_function("createLaser", (source, local_ref, target, code))?)
     }
 
+    /// Create an infrared pointer from `source` pointing at `target`.
+    /// `local_ref` is as in [`Spot::create_laser`]. Calls
+    /// `Spot.createInfraRed`.
     pub fn create_infra_red(
         lua: MizLua<'lua>,
         source: Object<'lua>,
@@ -47,29 +60,38 @@ impl<'lua> Spot<'lua> {
         Ok(spot.call_function("createInfraRed", (source, local_ref, target))?)
     }
 
+    /// Turn the spot off. Calls `Spot:destroy`.
     pub fn destroy(self) -> Result<()> {
         Ok(self.t.call_method("destroy", ())?)
     }
 
+    /// The position the spot is pointing at
     pub fn get_point(&self) -> Result<LuaVec3> {
         Ok(self.t.call_method("getPoint", ())?)
     }
 
+    /// Move the spot to point at `target`
     pub fn set_point(&self, target: LuaVec3) -> Result<()> {
         Ok(self.t.call_method("setPoint", target)?)
     }
 
+    /// The laser code of a laser spot
     pub fn get_code(&self) -> Result<u16> {
         Ok(self.t.call_method("getCode", ())?)
     }
 
+    /// Change the laser code of a laser spot
     pub fn set_code(&self, code: u16) -> Result<()> {
         Ok(self.t.call_method("setCode", code)?)
     }
 }
 
+/// Class marker for [`DcsOid`]s of [`Spot`]s
 #[derive(Debug, Clone)]
 pub struct ClassSpot;
+
+// Unlike most other DcsObject impls, these don't check that the spot still
+// exists.
 
 impl<'lua> DcsObject<'lua> for Spot<'lua> {
     type Class = ClassSpot;

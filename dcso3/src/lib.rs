@@ -11,6 +11,65 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! A minimal, safe Rust binding to the DCS World Lua scripting API, built on
+//! [`mlua`]. The goal is a direct translation of the DCS API, with Rust types
+//! and error handling layered on top.
+//!
+//! # Lua environments
+//!
+//! DCS has two separate Lua states a script DLL can be loaded into:
+//!
+//! - the mission scripting environment, where the simulation APIs
+//!   (`coalition`, `world`, `land`, `timer`, `trigger`, ...) live, and
+//! - the hooks (GUI/server) environment, where the `DCS` and `net` APIs and
+//!   the user callback hooks live.
+//!
+//! Functions that only work in one environment take a [`MizLua`] or a
+//! [`HooksLua`] token, thin `Copy` wrappers around `&Lua` that record which
+//! state they came from. Both implement [`LuaEnv`], which recovers the
+//! `&Lua`. [`create_root_module`] builds the table a DLL returns from its
+//! Lua module entry point; it exports `initHooks` and `initMiz`, which hand
+//! the matching token to the caller's init function. [`is_hooks_env`] tells
+//! the two states apart at runtime.
+//!
+//! # Wrapped tables
+//!
+//! Most DCS objects and singletons are Lua tables. [`wrapped_table!`]
+//! generates a struct holding an `mlua::Table` and the `&Lua` it belongs
+//! to. The struct derefs to the table and converts to and from Lua. If a
+//! class name is given, converting from Lua checks the table's metatable
+//! (its `className_` / `parentClass_` chain, see [`as_tbl`]) to make sure it
+//! is a DCS object of that class or a subclass. Methods on these types
+//! usually just call the corresponding DCS Lua function. [`simple_enum!`],
+//! [`bitflags_enum!`], [`string_enum!`], [`wrapped_prim!`], and
+//! [`atomic_id!`] generate Lua-convertible enums, newtypes, and ids.
+//!
+//! # Errors
+//!
+//! API functions return [`anyhow::Result`], and mlua errors convert into it
+//! with `?`. [`lua_err`] converts any `Debug` error back into an mlua
+//! [`LuaError`]. Where Lua calls into Rust (callbacks, init functions),
+//! [`wrap_f`] and [`wrap`] log errors and panics and return `R::default()`
+//! instead of raising a Lua error, so a failure in Rust does not propagate
+//! into DCS.
+//!
+//! # Shared types
+//!
+//! This module also defines types used throughout the crate: [`String`] (a
+//! compact string that converts from any Lua value), [`LuaVec2`],
+//! [`LuaVec3`], [`Position3`], [`Box3`], [`Quad2`], [`Color`], [`Time`],
+//! [`Sequence`] (a typed view of a Lua array), and [`Path`] (for looking up
+//! nested table fields), plus 2d/3d geometry helpers.
+//!
+//! # Modules
+//!
+//! Each module binds one DCS API: e.g. [`coalition`], [`world`], [`land`],
+//! [`timer`], [`trigger`], [`group`], [`unit`], [`airbase`], [`warehouse`],
+//! and [`mission_commands`] (F10 menus) in the mission environment; [`dcs`],
+//! [`net`], and [`hooks`] in the hooks environment; [`env`] for the mission
+//! (miz) data; [`event`] for DCS events; and [`perf`] for timing the
+//! bindings themselves.
+
 extern crate nalgebra as na;
 use anyhow::{anyhow, bail, Result};
 use compact_str::CompactString;
@@ -56,6 +115,17 @@ pub mod warehouse;
 pub mod weapon;
 pub mod world;
 
+/// Define `$name`, a process-unique `i64` id newtype.
+///
+/// `new` allocates ids from a global atomic counter (`MAX_<NAME>_ID`)
+/// starting at 0. Deserializing an id bumps the counter past it, so ids
+/// loaded from saved state are never handed out again by `new`. Converting
+/// from Lua does not touch the counter. Also generated: `From<i64>`,
+/// `FromStr`, `Display`, `Default` (which calls `new`, so it allocates),
+/// serde and Lua conversions, plus `inner`, `seq` (the next id), `setseq`
+/// (overwrite the counter), and `zero`.
+///
+/// Requires the `paste` and `serde` crates in the calling crate.
 #[macro_export]
 macro_rules! atomic_id {
     ($name:ident) => {
@@ -179,6 +249,8 @@ macro_rules! atomic_id {
     }
 }
 
+/// A quadrilateral in the 2d map plane, read from a Lua array of four
+/// `Vec2` tables (e.g. a quad shaped trigger zone).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Quad2 {
     pub p0: LuaVec2,
@@ -200,6 +272,8 @@ impl<'lua> FromLua<'lua> for Quad2 {
 }
 
 impl Quad2 {
+    /// True if `p` is inside the quad or is one of its vertices. Uses a
+    /// horizontal ray casting (even-odd) test, so it works for concave quads.
     pub fn contains(&self, p: LuaVec2) -> bool {
         fn horizontal_ray_intersects_edge(
             p: &LuaVec2,
@@ -242,6 +316,7 @@ impl Quad2 {
         intersections % 2 == 1
     }
 
+    /// The endpoints of the longest edge and its *squared* length.
     pub fn longest_edge(&self) -> (Vector2, Vector2, f64) {
         [
             (self.p0.0, self.p1.0),
@@ -263,6 +338,7 @@ impl Quad2 {
         )
     }
 
+    /// The average of the four vertices.
     pub fn center(&self) -> Vector2 {
         centroid2d([self.p0.0, self.p1.0, self.p2.0, self.p3.0])
     }
@@ -292,6 +368,7 @@ impl Quad2 {
 
     /// return true if the specified circle is fully contained within the quad.
     pub fn contains_circle(&self, center: Vector2, radius: f64) -> bool {
+        // distance from p to the closest point on segment ab
         fn distance_to_segment(p: Vector2, a: Vector2, b: Vector2) -> f64 {
             let ap = p - a;
             let ab = b - a;
@@ -306,6 +383,8 @@ impl Quad2 {
     }
 }
 
+/// An RGBA color with components in 0..=1, converted to and from a Lua
+/// array `{r, g, b, a}` as used by the DCS drawing functions.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Color {
     r: f32,
@@ -314,6 +393,7 @@ pub struct Color {
     a: f32,
 }
 
+// named colors, each taking the alpha component
 impl Color {
     pub fn black(a: f32) -> Color {
         Color { r: 0., g: 0., b: 0., a }
@@ -367,6 +447,10 @@ impl<'lua> IntoLua<'lua> for Color {
     }
 }
 
+/// Run `f` for a function called from Lua, named `name` in log messages.
+///
+/// Errors (see [`wrap`]) and panics are logged and turn into
+/// `Ok(R::default())`, so neither unwinds into, nor raises an error in, DCS.
 pub fn wrap_f<'lua, L: LuaEnv<'lua>, R: Default, F: FnOnce(L) -> Result<R>>(
     name: &str,
     lua: L,
@@ -384,6 +468,8 @@ pub fn wrap_f<'lua, L: LuaEnv<'lua>, R: Default, F: FnOnce(L) -> Result<R>>(
     }
 }
 
+/// Convert `res` for returning to Lua. An error is logged with `name` and
+/// replaced by `R::default()`; this never returns `Err`.
 pub fn wrap<'lua, R: Default>(name: &str, res: Result<R>) -> LuaResult<R> {
     match res {
         Ok(r) => Ok(r),
@@ -394,11 +480,16 @@ pub fn wrap<'lua, R: Default>(name: &str, res: Result<R>) -> LuaResult<R> {
     }
 }
 
+/// Convert any `Debug` error (typically an `anyhow::Error`) into a Lua
+/// runtime error carrying its debug formatting.
 pub fn lua_err<E: Debug>(err: E) -> LuaError {
     LuaError::RuntimeError(format!("{:?}", err))
 }
 
+/// A handle to a Lua state. Implemented by plain `&Lua` and by the
+/// environment tokens [`MizLua`] and [`HooksLua`].
 pub trait LuaEnv<'a> {
+    /// The underlying Lua state
     fn inner(self) -> &'a Lua;
 }
 
@@ -408,6 +499,9 @@ impl<'lua> LuaEnv<'lua> for &'lua Lua {
     }
 }
 
+/// The hooks (GUI/server) Lua environment, where `DCS`, `net`, and user
+/// callbacks live. Obtained from the `initHooks` export of
+/// [`create_root_module`].
 #[derive(Debug, Clone, Copy)]
 pub struct HooksLua<'lua>(&'lua Lua);
 
@@ -417,6 +511,9 @@ impl<'lua> LuaEnv<'lua> for HooksLua<'lua> {
     }
 }
 
+/// The mission scripting Lua environment, where the simulation APIs
+/// (`coalition`, `world`, `land`, ...) live. Obtained from the `initMiz`
+/// export of [`create_root_module`].
 #[derive(Debug, Clone, Copy)]
 pub struct MizLua<'lua>(&'lua Lua);
 
@@ -426,6 +523,12 @@ impl<'lua> LuaEnv<'lua> for MizLua<'lua> {
     }
 }
 
+/// Build the module table a DLL returns to Lua's `require`.
+///
+/// The table has two functions: `initHooks`, which calls `init_hooks` with
+/// a [`HooksLua`], and `initMiz`, which calls `init_miz` with a [`MizLua`].
+/// Lua code in each environment calls the matching one. Errors and panics
+/// from the init functions are logged, not raised (see [`wrap_f`]).
 pub fn create_root_module<H, M>(
     lua: &Lua,
     init_hooks: H,
@@ -451,6 +554,19 @@ where
     Ok(exports)
 }
 
+/// Define `$name<'lua>`, a typed wrapper around a Lua table.
+///
+/// `$class` is an `Option<&'static str>`. If it is `Some(class)`,
+/// converting from Lua fails unless the table's metatable says it is a DCS
+/// object of `class` or a subclass (see [`as_tbl`]); with `None` any table
+/// is accepted. The struct has fields `t` (the table) and `lua`, derefs to
+/// `mlua::Table`, implements `FromLua`/`IntoLua`, `Clone`, and `Serialize`.
+/// Its `Debug` impl prints DCS objects (tables with an `id_` field) as
+/// their class name and id, and other tables as JSON (see
+/// [`value_to_json`]).
+///
+/// The caller must have `Lua`, `Value`, `FromLua`, `IntoLua`, `LuaResult`,
+/// `Deref`, `Serialize`, and `as_tbl` in scope.
 #[macro_export]
 macro_rules! wrapped_table {
     ($name:ident, $class:expr) => {
@@ -508,6 +624,12 @@ macro_rules! wrapped_table {
     };
 }
 
+/// Define a fieldless enum `$name` with representation `$repr`, where each
+/// `$case => $num` gives a variant and its numeric value.
+///
+/// It converts to a Lua integer, and from a Lua number; an unknown number
+/// is a conversion error. The caller must have `Serialize`, `Deserialize`,
+/// the mlua prelude, `Value`, and `cvt_err` in scope.
 #[macro_export]
 macro_rules! simple_enum {
     ($name:ident, $repr:ident, [$($case:ident => $num:literal),+]) => {
@@ -535,6 +657,10 @@ macro_rules! simple_enum {
     };
 }
 
+/// Like [`simple_enum!`], but the enum is also annotated with
+/// `#[bitflags]` (from `enumflags2`, which must be in scope), so each
+/// `$num` should be a distinct power of two. Lua conversion handles single
+/// flags only, not combinations.
 #[macro_export]
 macro_rules! bitflags_enum {
     ($name:ident, $repr:ident, [$($case:ident => $num:literal),+]) => {
@@ -563,6 +689,15 @@ macro_rules! bitflags_enum {
     };
 }
 
+/// Define an enum `$name` whose variants map to Lua strings, each
+/// `$case => $str` giving a variant and its string.
+///
+/// The optional second list, `$altcase => $altstr`, gives extra strings that
+/// also convert to an existing variant (aliases); converting back to Lua
+/// always uses the primary string. Any other string converts to
+/// `Custom(String)`, so conversion from a string never fails. The caller
+/// must have `Serialize`, `Deserialize`, the mlua prelude, `Value`, and
+/// this crate's `String` in scope.
 #[macro_export]
 macro_rules! string_enum {
     ($name:ident, $repr:ident, [$($case:ident => $str:literal),+]) => {
@@ -602,6 +737,9 @@ macro_rules! string_enum {
     };
 }
 
+/// Define `$name`, a newtype around the primitive `$type` that converts to
+/// and from Lua as `$type` does. Any extra idents are added to the derive
+/// list (e.g. `Copy`, `Hash`). Also generates `inner` and `From<$type>`.
 #[macro_export]
 macro_rules! wrapped_prim {
     ($name:ident, $type:ty) => {
@@ -637,14 +775,17 @@ macro_rules! wrapped_prim {
     };
 }
 
+/// A `FromLuaConversionError` for a failed conversion to the type `to`.
 pub fn cvt_err(to: &'static str) -> LuaError {
     LuaError::FromLuaConversionError { from: "value", to, message: None }
 }
 
+/// A Lua runtime error with message `msg`.
 pub fn err(msg: &str) -> LuaError {
     LuaError::runtime(msg)
 }
 
+/// Borrow `value` as a table, or fail naming the target type `to`.
 pub fn as_tbl_ref<'a: 'lua, 'lua>(
     to: &'static str,
     value: &'a Value<'lua>,
@@ -652,6 +793,8 @@ pub fn as_tbl_ref<'a: 'lua, 'lua>(
     value.as_table().ok_or_else(|| anyhow!("can't convert {:?} to {}", value, to))
 }
 
+// DCS classes are metatables with a `className_` field and a `parentClass_`
+// link to the superclass. walk that chain looking for `class`.
 fn check_implements(tbl: &mlua::Table, class: &str) -> bool {
     let mut parent = None;
     loop {
@@ -672,6 +815,12 @@ fn check_implements(tbl: &mlua::Table, class: &str) -> bool {
     }
 }
 
+/// Convert `value` to a table, failing if it isn't one. `to` names the
+/// target type in error messages.
+///
+/// If `objtyp` is `Some(class)`, the table must also be a DCS object of
+/// that class or a subclass: it must have a metatable whose
+/// `className_` / `parentClass_` chain includes `class`.
 pub fn as_tbl<'lua>(
     to: &'static str,
     objtyp: Option<&'static str>,
@@ -699,7 +848,11 @@ pub fn as_tbl<'lua>(
     }
 }
 
+/// Copy a Lua value so that changes to the copy don't affect the original.
 pub trait DeepClone<'lua>: IntoLua<'lua> + FromLua<'lua> + Clone {
+    /// Tables are copied recursively (keys and values), and the copy shares
+    /// the original's metatable. Other values (functions, userdata, threads)
+    /// are shared, not copied. Cyclic tables are not handled.
     fn deep_clone(&self, lua: &'lua Lua) -> Result<Self>;
 }
 
@@ -733,10 +886,13 @@ where
     }
 }
 
+/// True if `lua` is the hooks environment, detected by the presence of the
+/// `DCS` global.
 pub fn is_hooks_env(lua: &Lua) -> bool {
     lua.globals().contains_key("DCS").unwrap_or(false)
 }
 
+/// One key in a [`Path`]: an integer (array index) or a string.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum PathElt {
     Integer(i64),
@@ -816,6 +972,9 @@ impl<'lua> FromLua<'lua> for PathElt {
     }
 }
 
+/// A sequence of keys locating a value nested inside Lua tables, e.g.
+/// `coalition.blue.country[1]`. Build one with [`path!`] and look it up
+/// with [`DcsTableExt`].
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Path(Vec<PathElt>);
 
@@ -849,6 +1008,7 @@ impl Path {
         self.0.pop()
     }
 
+    /// A copy of this path with `elts` added to the end.
     pub fn append<T: Into<PathElt>, I: IntoIterator<Item = T>>(&self, elts: I) -> Self {
         let mut new_t = self.clone();
         for elt in elts {
@@ -862,6 +1022,9 @@ impl Path {
     }
 }
 
+/// Build a [`Path`] from a list of keys, each anything that converts into a
+/// [`PathElt`], e.g. `path!["coalition", "blue", "country", 1]`. Expands to
+/// `dcso3::Path`, so it only works where the crate is named `dcso3`.
 #[macro_export]
 macro_rules! path {
     ($($v:expr),*) => {{
@@ -871,11 +1034,16 @@ macro_rules! path {
     }}
 }
 
+/// Look up a [`Path`] in nested tables. Fails if the path is empty, if an
+/// intermediate value isn't a table, or if the final value doesn't convert
+/// to `T`.
 pub trait DcsTableExt<'lua> {
+    /// Look up `path` using raw gets (ignoring metatables)
     fn raw_get_path<T>(&self, path: &Path) -> Result<T>
     where
         T: FromLua<'lua>;
 
+    /// Look up `path` using normal gets (respecting `__index` metamethods)
     fn get_path<T>(&self, path: &Path) -> Result<T>
     where
         T: FromLua<'lua>;
@@ -925,8 +1093,11 @@ impl<'lua> DcsTableExt<'lua> for mlua::Table<'lua> {
     }
 }
 
+/// A 2d vector. In DCS map coordinates `x` is north/south and `y` is
+/// east/west (see [`pointing_towards2`]).
 pub type Vector2 = na::base::Vector2<f64>;
 
+/// A [`Vector2`] that converts to and from a DCS `Vec2` table `{x, y}`.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
 pub struct LuaVec2(pub na::base::Vector2<f64>);
 
@@ -966,8 +1137,11 @@ impl LuaVec2 {
     }
 }
 
+/// A 3d vector. In DCS world coordinates `y` is altitude, and `x` and `z`
+/// are the horizontal axes.
 pub type Vector3 = na::base::Vector3<f64>;
 
+/// A [`Vector3`] that converts to and from a DCS `Vec3` table `{x, y, z}`.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
 pub struct LuaVec3(pub na::base::Vector3<f64>);
 
@@ -1012,11 +1186,16 @@ impl LuaVec3 {
     }
 }
 
+/// A DCS `Position3`: a point and an orientation.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Position3 {
+    /// The position
     pub p: LuaVec3,
+    /// Unit vector pointing forward
     pub x: LuaVec3,
+    /// Unit vector pointing up
     pub y: LuaVec3,
+    /// Unit vector pointing right
     pub z: LuaVec3,
 }
 
@@ -1043,6 +1222,7 @@ impl<'lua> IntoLua<'lua> for Position3 {
     }
 }
 
+/// A DCS `Box3`: an axis aligned box given by its `min` and `max` corners.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Box3 {
     pub min: LuaVec3,
@@ -1056,6 +1236,10 @@ impl<'lua> FromLua<'lua> for Box3 {
     }
 }
 
+/// The crate's string type, a [`CompactString`] (short strings are stored
+/// inline). Converting from Lua accepts more than strings: booleans and
+/// numbers are formatted as text, and other values use mlua's
+/// `Value::to_string`.
 #[derive(
     Debug, Clone, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
 )]
@@ -1130,6 +1314,8 @@ impl From<CompactString> for String {
     }
 }
 
+/// A DCS time value in seconds, as returned by e.g. `timer.getTime`.
+/// Subtracting two times gives the difference in seconds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Time(pub f32);
 
@@ -1167,6 +1353,7 @@ impl Sub for Time {
     }
 }
 
+/// The kinds of volume DCS can search in (`world.VolumeType`).
 #[derive(Debug, Clone, Serialize)]
 pub enum VolumeType {
     Segment,
@@ -1175,6 +1362,10 @@ pub enum VolumeType {
     Pyramid,
 }
 
+/// A typed view of a Lua array table whose elements are `T`. Elements are
+/// converted when accessed, so a bad element only fails when it is read.
+/// Converting `nil` from Lua gives an empty sequence. Indexes are 1-based,
+/// as in Lua.
 #[derive(Debug, Clone, Serialize)]
 pub struct Sequence<'lua, T> {
     t: mlua::Table<'lua>,
@@ -1241,6 +1432,9 @@ impl<'lua, T: FromLua<'lua> + 'lua> Sequence<'lua, T> {
         Ok(self.t.raw_get(1)?)
     }
 
+    /// Call `f` with every value in the table. This iterates all pairs, not
+    /// just the array part, and not necessarily in index order. Iteration
+    /// stops at, and returns, the first error from `f`.
     pub fn for_each<F: FnMut(Result<T>) -> Result<()>>(&self, mut f: F) -> Result<()> {
         Ok(self.t.for_each(|_: Value, v: Value| {
             f(T::from_lua(v, &self.lua).map_err(anyhow::Error::from)).map_err(lua_err)
@@ -1258,7 +1452,15 @@ impl<'lua, T: FromLua<'lua> + IntoLua<'lua> + 'lua> Sequence<'lua, T> {
     }
 }
 
+/// Convert a Lua value to JSON, for debugging output.
+///
+/// Tables become objects keyed by the stringified key. Functions, userdata,
+/// and threads become placeholder strings. A table that has already been
+/// converted (whether a cycle or just shared) becomes
+/// `"<Table(0x.. key)>"`, naming the key it was first seen under.
 pub fn value_to_json(v: &Value) -> serde_json::Value {
+    // the map of already visited tables, by address, to the key they were
+    // first seen under. cleared after each top level call.
     thread_local! {
         static CTX: RefCell<FxHashMap<usize, String>> = RefCell::new(FxHashMap::default());
     }
@@ -1310,6 +1512,7 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
     })
 }
 
+/// The average of `points`, or the zero vector if there are none.
 pub fn centroid2d(points: impl IntoIterator<Item = Vector2>) -> Vector2 {
     let (n, sum) =
         points.into_iter().fold((0, Vector2::new(0., 0.)), |(n, c), p| (n + 1, c + p));
@@ -1320,6 +1523,7 @@ pub fn centroid2d(points: impl IntoIterator<Item = Vector2>) -> Vector2 {
     }
 }
 
+/// The average of `points`, or the zero vector if there are none.
 pub fn centroid3d(points: impl IntoIterator<Item = Vector3>) -> Vector3 {
     let (n, sum) = points
         .into_iter()
@@ -1369,6 +1573,7 @@ pub fn pointing_towards2(angle: f64) -> Vector2 {
     Vector2::new(cos, sin).normalize()
 }
 
+/// A vector perpendicular to `v` with the same length, `(v.y, -v.x)`.
 pub fn normal2(v: Vector2) -> Vector2 {
     Vector2::new(v.y, -v.x)
 }
@@ -1404,6 +1609,8 @@ pub fn change_heading(heading: f64, change: f64) -> f64 {
     }
 }
 
+/// The azimuth (heading) of `v` in radians, in 0..2pi, measured from the
+/// `x` (north) axis towards the `y` axis.
 pub fn azumith2d(v: Vector2) -> f64 {
     let az = v.y.atan2(v.x);
     if az < 0. {
@@ -1413,10 +1620,14 @@ pub fn azumith2d(v: Vector2) -> f64 {
     }
 }
 
+/// The azimuth in radians from `from` to `to` (see [`azumith2d`]).
 pub fn azumith2d_to(from: Vector2, to: Vector2) -> f64 {
     azumith2d(to - from)
 }
 
+/// The azimuth of `v` in radians, in 0..2pi, in the horizontal (`x`, `z`)
+/// plane, measured from the `x` axis towards the `z` axis. Altitude (`y`)
+/// is ignored.
 pub fn azumith3d(v: Vector3) -> f64 {
     let az = v.z.atan2(v.x);
     if az < 0. {
@@ -1426,6 +1637,7 @@ pub fn azumith3d(v: Vector3) -> f64 {
     }
 }
 
+/// The azimuth in radians from `from` to `to` (see [`azumith3d`]).
 pub fn azumith3d_to(from: Vector3, to: Vector3) -> f64 {
     azumith3d(to - from)
 }

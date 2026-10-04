@@ -11,6 +11,21 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Typed access to the mission (`.miz`) table.
+//!
+//! A `.miz` file's `mission` file is a big Lua table describing the
+//! mission as authored in the editor: coalitions, their countries, the
+//! groups and units of each country (by category), trigger zones,
+//! weather, and so on. In the mission scripting environment it is
+//! `env.mission`, in the hooks environment `_current_mission.mission`;
+//! [`Miz::singleton`] fetches the right one.
+//!
+//! The types here are thin wrappers over the raw tables, mostly
+//! getters (and a few setters) for named fields. [`Miz::index`] walks
+//! the whole mission once and builds a [`MizIndex`], which records the
+//! table path of every group, unit, and trigger zone so they can later
+//! be looked up by id or name without searching.
+
 use crate::{
     as_tbl, coalition::Side, controller::MissionPoint, country, is_hooks_env, net::SlotId,
     string_enum, wrapped_prim, wrapped_table, Color, DcsTableExt, LuaEnv, LuaVec2, Path, Quad2,
@@ -22,8 +37,10 @@ use mlua::{prelude::*, Value};
 use serde_derive::{Deserialize, Serialize};
 use std::{cmp::max, collections::hash_map::Entry, ops::Deref};
 
+// The mission's `weather` table. No accessors yet, use the raw table.
 wrapped_table!(Weather, None);
 
+// A unit id as stored in the mission (`unitId`).
 wrapped_prim!(UnitId, i64, Hash, Copy);
 
 impl Default for UnitId {
@@ -33,11 +50,14 @@ impl Default for UnitId {
 }
 
 impl UnitId {
+    /// Increment the id in place, e.g. to allocate a new id after
+    /// [`MizIndex::max_uid`]
     pub fn next(&mut self) {
         self.0 += 1
     }
 }
 
+// A group id as stored in the mission (`groupId`).
 wrapped_prim!(GroupId, i64, Hash, Copy);
 
 impl Default for GroupId {
@@ -47,11 +67,15 @@ impl Default for GroupId {
 }
 
 impl GroupId {
+    /// Increment the id in place, e.g. to allocate a new id after
+    /// [`MizIndex::max_gid`]
     pub fn next(&mut self) {
         self.0 += 1
     }
 }
 
+// The `skill` field of a unit. `Client` and `Player` mark slots flown by
+// humans. Unrecognized strings become `Custom`.
 string_enum!(Skill, u8, [
     Client => "Client",
     Excellant => "Excellant",
@@ -61,6 +85,7 @@ string_enum!(Skill, u8, [
     High => "High"
 ]);
 
+/// A key/value property attached to a trigger zone in the editor
 #[derive(Debug, Clone)]
 pub struct Property {
     pub key: String,
@@ -77,14 +102,19 @@ impl<'lua> FromLua<'lua> for Property {
     }
 }
 
+/// The shape of a trigger zone
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum TriggerZoneTyp {
+    /// A circle centered on the zone position (mission `type` 0)
     Circle { radius: f64 },
+    /// A four sided polygon given by its vertices (mission `type` 2)
     Quad(Quad2),
 }
 
+// A trigger zone id as stored in the mission (`zoneId`).
 wrapped_prim!(TriggerZoneId, i64, Copy, Hash);
 
+// A trigger zone, an element of the mission's `triggers.zones` list.
 wrapped_table!(TriggerZone, None);
 
 impl<'lua> TriggerZone<'lua> {
@@ -92,6 +122,7 @@ impl<'lua> TriggerZone<'lua> {
         Ok(self.raw_get("name")?)
     }
 
+    /// The zone position from its `x` and `y` fields
     pub fn pos(&self) -> Result<na::base::Vector2<f64>> {
         Ok(na::base::Vector2::new(
             self.raw_get("x")?,
@@ -99,11 +130,14 @@ impl<'lua> TriggerZone<'lua> {
         ))
     }
 
+    /// The zone shape. Returns an error for zone types other than 0
+    /// (circle) and 2 (quad).
     pub fn typ(&self) -> Result<TriggerZoneTyp> {
         Ok(match self.raw_get("type")? {
             0 => TriggerZoneTyp::Circle {
                 radius: self.raw_get("radius")?,
             },
+            // the mission file spells the key "verticies"
             2 => TriggerZoneTyp::Quad(self.raw_get("verticies")?),
             n => bail!("unknown trigger zone type {}", n),
         })
@@ -117,15 +151,19 @@ impl<'lua> TriggerZone<'lua> {
         Ok(self.raw_get("zoneId")?)
     }
 
+    /// The custom properties set on the zone in the editor
     pub fn properties(&self) -> Result<Sequence<'lua, Property>> {
         Ok(self.raw_get("properties")?)
     }
 }
 
+// An element of a coalition's `nav_points` list. No accessors yet.
 wrapped_table!(NavPoint, None);
 
+// An element of a group's `tasks` list. No accessors yet.
 wrapped_table!(Task, None);
 
+// A group's `route` table, which holds its waypoints.
 wrapped_table!(Route, None);
 
 impl<'lua> Route<'lua> {
@@ -133,11 +171,14 @@ impl<'lua> Route<'lua> {
         Ok(self.t.raw_get("points")?)
     }
 
+    /// Replace the route's waypoint list
     pub fn set_points(&self, points: Vec<MissionPoint>) -> Result<()> {
         Ok(self.t.raw_set("points", points)?)
     }
 }
 
+// A unit as defined in the mission, an element of a group's `units` list.
+// Setters modify the mission table in place.
 wrapped_table!(Unit, None);
 
 impl<'lua> Unit<'lua> {
@@ -153,6 +194,7 @@ impl<'lua> Unit<'lua> {
         Ok(self.raw_set("unitId", id)?)
     }
 
+    /// The multiplayer slot id of this unit, derived from its unit id
     pub fn slot(&self) -> Result<SlotId> {
         Ok(SlotId::from(self.id()?))
     }
@@ -161,6 +203,7 @@ impl<'lua> Unit<'lua> {
         Ok(self.raw_set("name", name)?)
     }
 
+    /// The unit position from its `x` and `y` fields
     pub fn pos(&self) -> Result<na::base::Vector2<f64>> {
         Ok(na::base::Vector2::new(
             self.raw_get("x")?,
@@ -178,11 +221,14 @@ impl<'lua> Unit<'lua> {
         Ok(self.raw_get("heading")?)
     }
 
+    /// Set the unit heading. Also sets `psi`, which the mission stores
+    /// as the negated heading, so the two fields stay consistent.
     pub fn set_heading(&self, h: f64) -> Result<()> {
         self.raw_set("psi", -h)?;
         Ok(self.raw_set("heading", h)?)
     }
 
+    /// The `alt` field, `None` if the unit has none
     pub fn alt(&self) -> Result<Option<f64>> {
         Ok(self.raw_get("alt")?)
     }
@@ -191,6 +237,7 @@ impl<'lua> Unit<'lua> {
         Ok(self.raw_set("alt", a)?)
     }
 
+    /// The unit type name, e.g. `"F-16C_50"`
     pub fn typ(&self) -> Result<String> {
         Ok(self.raw_get("type")?)
     }
@@ -200,6 +247,8 @@ impl<'lua> Unit<'lua> {
     }
 }
 
+// A group as defined in the mission, an element of a country's per category
+// `group` list. Setters modify the mission table in place.
 wrapped_table!(Group, None);
 
 impl<'lua> Group<'lua> {
@@ -211,6 +260,7 @@ impl<'lua> Group<'lua> {
         Ok(self.raw_set("name", name)?)
     }
 
+    /// The group position from its `x` and `y` fields
     pub fn pos(&self) -> Result<na::base::Vector2<f64>> {
         Ok(na::base::Vector2::new(
             self.t.raw_get("x")?,
@@ -228,10 +278,12 @@ impl<'lua> Group<'lua> {
         Ok(self.raw_get("frequency")?)
     }
 
+    /// The raw `modulation` field of the group radio
     pub fn modulation(&self) -> Result<i64> {
         Ok(self.raw_get("modulation")?)
     }
 
+    /// The `lateActivation` flag, false if missing or unreadable
     pub fn late_activation(&self) -> bool {
         self.raw_get("lateActivation").unwrap_or(false)
     }
@@ -256,6 +308,7 @@ impl<'lua> Group<'lua> {
         Ok(self.raw_set("route", r)?)
     }
 
+    /// The `hidden` flag, false if missing or unreadable
     pub fn hidden(&self) -> bool {
         self.raw_get("hidden").unwrap_or(false)
     }
@@ -264,11 +317,17 @@ impl<'lua> Group<'lua> {
         Ok(self.raw_get("units")?)
     }
 
+    /// The `uncontrolled` flag. Note this is true if the field can't be
+    /// read; a missing (nil) field reads as false.
     pub fn uncontrolled(&self) -> bool {
         self.raw_get("uncontrolled").unwrap_or(true)
     }
 }
 
+// A country within a coalition. Its groups are stored per category under
+// `plane`, `helicopter`, `ship`, `vehicle` and `static`, each holding a
+// `group` list. The accessors return an empty sequence if a category is
+// absent.
 wrapped_table!(Country, None);
 
 impl<'lua> Country<'lua> {
@@ -311,6 +370,8 @@ impl<'lua> Country<'lua> {
     }
 }
 
+// One side's entry in the mission's `coalition` table, holding its
+// bullseye, nav points and countries.
 wrapped_table!(Coalition, None);
 
 impl<'lua> Coalition<'lua> {
@@ -330,6 +391,7 @@ impl<'lua> Coalition<'lua> {
         Ok(self.t.raw_get("country")?)
     }
 
+    /// Find the country with id `country` in this coalition by linear search
     pub fn country(&self, country: country::Country) -> Result<Option<Country<'lua>>> {
         for c in self.countries()? {
             let c = c?;
@@ -340,13 +402,21 @@ impl<'lua> Coalition<'lua> {
         return Ok(None);
     }
 
+    /// Index every group and unit in this coalition. `base` is the path of
+    /// this coalition's table within the mission; recorded paths are
+    /// relative to the mission root. Fails on any duplicate group id,
+    /// group name, unit id or unit name within the coalition.
     fn index(&self, side: Side, base: Path) -> Result<CoalitionIndex> {
         let base = base.append(["country"]);
         let mut idx = CoalitionIndex::default();
         for (i, country) in self.countries()?.into_iter().enumerate() {
             let country = country?;
             let cid = country.id()?;
+            // lua sequences are 1 based
             let base = base.append([i + 1]);
+            // index the groups (and their units) of one category, `$name` is
+            // the category key in the country table, `$tbl` both the
+            // `Country` accessor and the per category `CoalitionIndex` map
             macro_rules! index_group {
                 ($name:literal, $cat:expr, $tbl:ident) => {
                     for (i, group) in country.$tbl()?.into_iter().enumerate() {
@@ -410,6 +480,7 @@ impl<'lua> Coalition<'lua> {
     }
 }
 
+/// The number of slots for a ground control role on each side
 #[derive(Debug, Clone, Copy)]
 pub struct Role {
     pub neutrals: u8,
@@ -428,6 +499,8 @@ impl<'lua> FromLua<'lua> for Role {
     }
 }
 
+// The `roles` table of `GroundControl`, giving per side slot counts for the
+// combined arms and observer roles.
 wrapped_table!(Roles, None);
 
 impl<'lua> Roles<'lua> {
@@ -448,6 +521,7 @@ impl<'lua> Roles<'lua> {
     }
 }
 
+// The mission's `groundControl` table (combined arms / game master settings).
 wrapped_table!(GroundControl, None);
 
 impl<'lua> GroundControl<'lua> {
@@ -456,30 +530,41 @@ impl<'lua> GroundControl<'lua> {
     }
 }
 
+/// Where an indexed group lives in the mission table, and its owner
 #[derive(Debug, Clone, Serialize)]
 struct IndexedGroup {
     side: Side,
     country: country::Country,
     category: GroupKind,
+    /// The path of the group table from the mission root
     path: Path,
 }
 
+/// Where an indexed unit lives in the mission table, and its owner
 #[derive(Debug, Clone, Serialize)]
 struct IndexedUnit {
     side: Side,
     country: country::Country,
+    /// The path of the unit table from the mission root
     path: Path,
 }
 
+/// The index of one coalition's groups and units, built by
+/// [`Miz::index`]
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct CoalitionIndex {
+    /// The largest unit id seen
     max_uid: UnitId,
+    /// The largest group id seen
     max_gid: GroupId,
     units: FxHashMap<UnitId, IndexedUnit>,
     units_by_name: FxHashMap<String, UnitId>,
     groups: FxHashMap<GroupId, IndexedGroup>,
+    /// Group names of every category
     groups_by_name: FxHashMap<String, GroupId>,
+    /// The group each unit belongs to
     groups_by_unit: FxHashMap<UnitId, GroupId>,
+    // group names by category
     planes: FxHashMap<String, GroupId>,
     helicopters: FxHashMap<String, GroupId>,
     ships: FxHashMap<String, GroupId>,
@@ -487,13 +572,19 @@ pub struct CoalitionIndex {
     statics: FxHashMap<String, GroupId>,
 }
 
+/// An index of the mission, built by [`Miz::index`], mapping group, unit and
+/// trigger zone ids and names to their path in the mission table. Pass it
+/// to the `Miz` lookup methods. It only reflects the mission as it was when
+/// indexed.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct MizIndex {
     by_side: FxHashMap<Side, CoalitionIndex>,
+    /// Trigger zone name to its path from the mission root
     triggers: FxHashMap<String, Path>,
 }
 
 impl MizIndex {
+    /// The largest unit id in the mission, across all coalitions
     pub fn max_uid(&self) -> UnitId {
         self.by_side
             .iter()
@@ -502,6 +593,7 @@ impl MizIndex {
             })
     }
 
+    /// The largest group id in the mission, across all coalitions
     pub fn max_gid(&self) -> GroupId {
         self.by_side
             .iter()
@@ -511,8 +603,11 @@ impl MizIndex {
     }
 }
 
+/// The category a group is stored under in its country table
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum GroupKind {
+    /// Matches every category, for lookups only. Indexed groups always have
+    /// a specific kind.
     Any,
     Plane,
     Helicopter,
@@ -521,6 +616,7 @@ pub enum GroupKind {
     Static,
 }
 
+/// A group found through a [`MizIndex`], with its side, country and category
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupInfo<'lua> {
     pub side: Side,
@@ -529,6 +625,7 @@ pub struct GroupInfo<'lua> {
     pub group: Group<'lua>,
 }
 
+/// A unit found through a [`MizIndex`], with its side and country
 #[derive(Debug, Clone, Serialize)]
 pub struct UnitInfo<'lua> {
     pub side: Side,
@@ -536,9 +633,12 @@ pub struct UnitInfo<'lua> {
     pub unit: Unit<'lua>,
 }
 
+// The root mission table.
 wrapped_table!(Miz, None);
 
 impl<'lua> Miz<'lua> {
+    /// Get the current mission table: `_current_mission.mission` in the
+    /// hooks environment, `env.mission` in the mission scripting environment
     pub fn singleton<L: LuaEnv<'lua> + Copy>(lua: L) -> Result<Self> {
         if is_hooks_env(lua.inner()) {
             let current: mlua::Table = lua.inner().globals().get("_current_mission")?;
@@ -553,11 +653,13 @@ impl<'lua> Miz<'lua> {
         Ok(self.raw_get("groundControl")?)
     }
 
+    /// The coalition table for `side`, from `coalition[side.to_str()]`
     pub fn coalition(&self, side: Side) -> Result<Coalition<'lua>> {
         let coa: mlua::Table = self.raw_get("coalition")?;
         Ok(coa.raw_get(side.to_str())?)
     }
 
+    /// The trigger zones, from `triggers.zones`
     pub fn triggers(&self) -> Result<Sequence<'lua, TriggerZone<'lua>>> {
         let triggers: mlua::Table = self.t.raw_get("triggers")?;
         Ok(triggers.raw_get("zones")?)
@@ -567,6 +669,8 @@ impl<'lua> Miz<'lua> {
         Ok(self.t.raw_get("weather")?)
     }
 
+    /// Look up a group by id using `idx`. `Ok(None)` if the id isn't in the
+    /// index; an error if the indexed path no longer resolves.
     pub fn get_group(&self, idx: &MizIndex, id: &GroupId) -> Result<Option<GroupInfo<'lua>>> {
         idx.by_side
             .iter()
@@ -582,6 +686,8 @@ impl<'lua> Miz<'lua> {
             .transpose()
     }
 
+    /// Look up a group of `side` by name. With [`GroupKind::Any`] every
+    /// category is searched, otherwise only the given one.
     pub fn get_group_by_name(
         &self,
         idx: &MizIndex,
@@ -603,6 +709,7 @@ impl<'lua> Miz<'lua> {
             .transpose()
     }
 
+    /// Look up a unit by id using `idx`, `Ok(None)` if it isn't indexed
     pub fn get_unit(&self, idx: &MizIndex, id: &UnitId) -> Result<Option<UnitInfo<'lua>>> {
         idx.by_side
             .iter()
@@ -617,6 +724,7 @@ impl<'lua> Miz<'lua> {
             .transpose()
     }
 
+    /// Look up a unit by name in any coalition, `Ok(None)` if not indexed
     pub fn get_unit_by_name(&self, idx: &MizIndex, name: &str) -> Result<Option<UnitInfo<'lua>>> {
         idx.by_side
             .iter()
@@ -631,6 +739,7 @@ impl<'lua> Miz<'lua> {
             .transpose()
     }
 
+    /// The group that the unit with id `id` belongs to
     pub fn get_group_by_unit(
         &self,
         idx: &MizIndex,
@@ -643,6 +752,7 @@ impl<'lua> Miz<'lua> {
             .transpose()
     }
 
+    /// The group that the unit called `name` belongs to
     pub fn get_group_by_unit_name(
         &self,
         idx: &MizIndex,
@@ -659,6 +769,7 @@ impl<'lua> Miz<'lua> {
             .transpose()
     }
 
+    /// Look up a trigger zone by name using `idx`
     pub fn get_trigger_zone(
         &self,
         idx: &MizIndex,
@@ -674,6 +785,11 @@ impl<'lua> Miz<'lua> {
         Ok(self.raw_get("sortie")?)
     }
 
+    /// Walk the mission and build a [`MizIndex`] of every trigger zone,
+    /// group and unit. Fails if a trigger zone name is duplicated, or if
+    /// a coalition contains duplicate group/unit ids or names (see
+    /// [`Coalition`]'s indexing). Duplicates across coalitions are not
+    /// detected.
     pub fn index(&self) -> Result<MizIndex> {
         let base = Path::default();
         let mut idx = MizIndex::default();

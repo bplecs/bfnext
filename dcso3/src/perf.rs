@@ -11,6 +11,15 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Timing of calls into the DCS API.
+//!
+//! Wrapping a call in [`record_perf!`] records how long it took, in
+//! nanoseconds, in the matching [`HistogramSer`] field of a global
+//! [`PerfInner`] (only when the `perf` feature is enabled; otherwise the
+//! macro just evaluates the expression). [`Perf::stat`] summarizes the
+//! histograms as [`PerfStat`], which can be logged. Histograms serialize as
+//! base64 encoded, deflate compressed HdrHistogram V2 data.
+
 use bytes::{BufMut, BytesMut};
 use chrono::prelude::*;
 use compact_str::format_compact;
@@ -27,6 +36,8 @@ use std::{
     sync::Arc,
 };
 
+/// A serde serializable [`Histogram`]. The default tracks values from 1 to
+/// 1e9 (1 second, when recording nanoseconds) with 3 significant digits.
 #[derive(Debug, Clone)]
 pub struct HistogramSer(Histogram<u64>);
 
@@ -75,6 +86,7 @@ impl Serialize for HistogramSer {
     {
         use base64::prelude::*;
         use ser::Error;
+        // reuse the serializer and buffers between calls to avoid allocating
         thread_local! {
             static SER: RefCell<(V2DeflateSerializer, BytesMut, String)> = RefCell::new(
                 (V2DeflateSerializer::default(), BytesMut::new(), String::new()));
@@ -138,6 +150,9 @@ impl<'de> Deserialize<'de> for HistogramSer {
     }
 }
 
+/// A running timer. When committed (explicitly, or on drop) it records the
+/// nanoseconds elapsed since it was created into its histogram. Durations
+/// outside 1ns..=1s are discarded, since the histogram can't hold them.
 pub struct Snap<'a> {
     ts: DateTime<Utc>,
     perf: Option<&'a mut HistogramSer>,
@@ -157,6 +172,7 @@ impl<'a> Snap<'a> {
         }
     }
 
+    /// Record the elapsed time. Only the first call records anything.
     pub fn commit(&mut self) {
         if let Some(h) = self.perf.take() {
             if let Some(ns) = (Utc::now() - self.ts).num_nanoseconds() {
@@ -168,6 +184,9 @@ impl<'a> Snap<'a> {
     }
 }
 
+/// Summary statistics of a histogram of nanosecond timings: the sample
+/// count, the mean, and percentiles (25th, 50th, 90th, 99th, 99.9th), in
+/// `unit` (either "ns" or "us").
 #[derive(Debug, Clone, Copy)]
 pub struct HistStat {
     pub name: &'static str,
@@ -182,6 +201,8 @@ pub struct HistStat {
 }
 
 impl HistStat {
+    /// A stat with no samples. `ns` selects nanosecond rather than
+    /// microsecond units.
     pub fn empty(name: &'static str, ns: bool) -> Self {
         Self {
             name,
@@ -196,6 +217,8 @@ impl HistStat {
         }
     }
 
+    /// Summarize `h`, whose values are nanoseconds. If `ns` is false the
+    /// results are converted to (truncated) microseconds.
     pub fn new(h: &Histogram<u64>, name: &'static str, ns: bool) -> Self {
         let n = h.len();
         let d = if ns { 1 } else { 1000 };
@@ -219,6 +242,8 @@ impl HistStat {
         }
     }
 
+    /// Log the stat at info level, padding the name to `pad` characters.
+    /// Nothing is logged if there are no samples.
     pub fn log(&self, pad: usize) {
         let Self {
             name,
@@ -239,6 +264,8 @@ impl HistStat {
     }
 }
 
+/// One timing histogram per instrumented DCS API call. Field names are the
+/// keys passed to [`record_perf!`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PerfInner {
     pub get_position: HistogramSer,
@@ -260,9 +287,14 @@ pub struct PerfInner {
     pub timer_get_time0: HistogramSer,
 }
 
+/// Shared, copy on write timing data. Cloning is cheap and gives a snapshot:
+/// [`record_perf!`] uses `Arc::make_mut`, so recording into the global
+/// copy while a clone is alive copies the data first rather than changing
+/// the clone.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Perf(pub Arc<PerfInner>);
 
+// the global timing data, created on first use by `Perf::get_mut`
 static mut PERF: Option<Perf> = None;
 
 impl Deref for Perf {
@@ -280,6 +312,13 @@ impl Clone for Perf {
 }
 
 impl Perf {
+    /// The global timing data, created if it doesn't exist yet.
+    ///
+    /// # Safety
+    ///
+    /// This hands out a `&'static mut` to a `static mut` with no
+    /// synchronization. The caller must ensure it is only used from one
+    /// thread and that no other reference to it is live at the same time.
     pub unsafe fn get_mut() -> &'static mut Perf {
         #[allow(static_mut_refs)]
         let perf = PERF.as_mut();
@@ -293,10 +332,19 @@ impl Perf {
         }
     }
 
+    /// Discard the global timing data; the next [`Perf::get_mut`] starts
+    /// fresh.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Perf::get_mut`]; in particular no reference returned by it
+    /// may still be in use.
     pub unsafe fn reset() {
         PERF = None;
     }
 
+    /// Summarize every histogram, in microseconds, labelled with the DCS
+    /// function it times.
     pub fn stat(&self) -> PerfStat {
         let PerfInner {
             get_position,
@@ -351,6 +399,7 @@ impl Perf {
     }
 }
 
+/// Summary statistics for each field of [`PerfInner`], see [`Perf::stat`].
 #[derive(Debug, Clone, Copy)]
 pub struct PerfStat {
     pub get_position: HistStat,
@@ -397,6 +446,7 @@ impl Default for PerfStat {
 }
 
 impl PerfStat {
+    /// Log every stat that has samples, one line each, with names aligned.
     pub fn log(&self) {
         use std::cmp::max;
         let Self {
@@ -444,6 +494,11 @@ impl PerfStat {
     }
 }
 
+/// Evaluate `$e`, recording how long it took in the global
+/// [`PerfInner`](crate::perf::PerfInner) field `$key` (see
+/// [`Perf::get_mut`](crate::perf::Perf::get_mut)). This version is compiled with the
+/// `perf` feature. It refers to `crate::perf`, so it only works inside this
+/// crate.
 #[cfg(feature = "perf")]
 #[macro_export]
 macro_rules! record_perf {
@@ -459,6 +514,7 @@ macro_rules! record_perf {
     }};
 }
 
+/// Without the `perf` feature, `record_perf!` just evaluates `$e`.
 #[cfg(not(feature = "perf"))]
 #[macro_export]
 macro_rules! record_perf {
@@ -467,6 +523,8 @@ macro_rules! record_perf {
     };
 }
 
+/// Record the nanoseconds elapsed since `start_ts` into `h`, discarding
+/// durations outside 1ns..=1s like [`Snap`] does.
 pub fn record_perf(h: &mut HistogramSer, start_ts: DateTime<Utc>) {
     if let Some(ns) = (Utc::now() - start_ts).num_nanoseconds() {
         if ns >= 1 && ns <= 1_000_000_000 {

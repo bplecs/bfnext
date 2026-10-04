@@ -11,6 +11,15 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Bindings to the DCS `missionCommands` singleton, which builds the F10
+//! "Other" radio menu.
+//!
+//! Menu items can be added for everyone, for one coalition, or for one
+//! group. DCS identifies each item by its path, the list of menu names
+//! leading to it, which is returned when the item is added and passed back
+//! to remove it or to add children under it. Each scope (all, coalition,
+//! group) has its own path types so they can't be mixed up.
+
 use crate::{
     as_tbl, coalition::Side, env::miz::GroupId, wrap_f, wrapped_table, LuaEnv, MizLua, String,
 };
@@ -20,6 +29,8 @@ use mlua::{prelude::*, Value};
 use serde_derive::Serialize;
 use std::ops::Deref;
 
+/// A menu item path: the names of the menus leading to the item, ending
+/// with the item's own name. Converted to and from a Lua array of strings.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ItemPath(Vec<String>);
 
@@ -45,6 +56,7 @@ impl<'lua> FromLua<'lua> for ItemPath {
     }
 }
 
+// Define a public newtype around `ItemPath`, one per kind of menu item.
 macro_rules! item {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,6 +88,9 @@ macro_rules! item {
     };
 }
 
+// Paths of menu items. `SubMenu` and `CommandItem` are visible to everyone,
+// the `Coalition` variants to one side, and the `Group` variants to one
+// group.
 item!(SubMenu);
 item!(CoalitionSubMenu);
 item!(GroupSubMenu);
@@ -83,17 +98,25 @@ item!(CommandItem);
 item!(CoalitionCommandItem);
 item!(GroupCommandItem);
 
+// The global `missionCommands` table.
 wrapped_table!(MissionCommands, None);
 
 impl<'lua> MissionCommands<'lua> {
+    /// Get the global `missionCommands` table
     pub fn singleton(lua: MizLua<'lua>) -> Result<Self> {
         Ok(lua.inner().globals().raw_get("missionCommands")?)
     }
 
+    /// Add a submenu called `name` for everyone, under `parent` or at the
+    /// top level if `parent` is `None`. Calls `missionCommands.addSubMenu`.
     pub fn add_submenu(&self, name: String, parent: Option<SubMenu>) -> Result<SubMenu> {
         Ok(self.call_function("addSubMenu", (name, parent))?)
     }
 
+    /// Add a command called `name` for everyone, under `parent` or at the
+    /// top level. When selected, `f` is called with `arg`. Calls
+    /// `missionCommands.addCommand`. Errors and panics in `f` are logged,
+    /// not raised in Lua.
     pub fn add_command<F, A>(
         &self,
         name: String,
@@ -105,6 +128,7 @@ impl<'lua> MissionCommands<'lua> {
         F: Fn(MizLua, A) -> Result<()> + 'static,
         A: IntoLua<'lua> + FromLua<'lua>,
     {
+        // used as the log context if f fails
         let msg = format_compact!("command {:?},{name}", parent);
         let f = self.lua.create_function(move |lua, arg: A| {
             wrap_f(msg.as_str(), MizLua(lua), |lua| f(lua, arg))
@@ -112,14 +136,19 @@ impl<'lua> MissionCommands<'lua> {
         Ok(self.call_function("addCommand", (name, parent, f, arg))?)
     }
 
+    /// Remove a submenu and everything in it. Calls
+    /// `missionCommands.removeItem`.
     pub fn remove_submenu(&self, menu: SubMenu) -> Result<()> {
         Ok(self.call_function("removeItem", menu)?)
     }
 
+    /// Remove a command. Calls `missionCommands.removeItem`.
     pub fn remove_command(&self, item: CommandItem) -> Result<()> {
         Ok(self.call_function("removeItem", item)?)
     }
 
+    /// Like [`MissionCommands::add_submenu`], but visible only to `side`.
+    /// Calls `missionCommands.addSubMenuForCoalition`.
     pub fn add_submenu_for_coalition(
         &self,
         side: Side,
@@ -129,6 +158,8 @@ impl<'lua> MissionCommands<'lua> {
         Ok(self.call_function("addSubMenuForCoalition", (side, name, parent))?)
     }
 
+    /// Like [`MissionCommands::add_command`], but visible only to `side`.
+    /// Calls `missionCommands.addCommandForCoalition`.
     pub fn add_command_for_coalition<F, A>(
         &self,
         side: Side,
@@ -148,14 +179,18 @@ impl<'lua> MissionCommands<'lua> {
         Ok(self.call_function("addCommandForCoalition", (side, name, parent, f, arg))?)
     }
 
+    /// Calls `missionCommands.removeItemForCoalition`
     pub fn remove_submenu_for_coalition(&self, side: Side, menu: CoalitionSubMenu) -> Result<()> {
         Ok(self.call_function("removeItemForCoalition", (side, menu))?)
     }
 
+    /// Calls `missionCommands.removeItemForCoalition`
     pub fn remove_command_for_coalition(&self, side: Side, item: CoalitionCommandItem) -> Result<()> {
         Ok(self.call_function("removeItemForCoalition", (side, item))?)
     }
 
+    /// Like [`MissionCommands::add_submenu`], but visible only to `group`.
+    /// Calls `missionCommands.addSubMenuForGroup`.
     pub fn add_submenu_for_group(
         &self,
         group: GroupId,
@@ -165,6 +200,8 @@ impl<'lua> MissionCommands<'lua> {
         Ok(self.call_function("addSubMenuForGroup", (group, name, parent))?)
     }
 
+    /// Like [`MissionCommands::add_command`], but visible only to `group`.
+    /// Calls `missionCommands.addCommandForGroup`.
     pub fn add_command_for_group<F, A>(
         &self,
         group: GroupId,
@@ -184,14 +221,18 @@ impl<'lua> MissionCommands<'lua> {
         Ok(self.call_function("addCommandForGroup", (group, name, parent, f, arg))?)
     }
 
+    /// Calls `missionCommands.removeItemForGroup`
     pub fn remove_submenu_for_group(&self, group: GroupId, menu: GroupSubMenu) -> Result<()> {
         Ok(self.call_function("removeItemForGroup", (group, menu))?)
     }
 
+    /// Calls `missionCommands.removeItemForGroup`
     pub fn remove_command_for_group(&self, group: GroupId, item: GroupCommandItem) -> Result<()> {
         Ok(self.call_function("removeItemForGroup", (group, item))?)
     }
 
+    /// Remove all menu items by calling `missionCommands.removeItem` with
+    /// no path.
     pub fn clear_all_menus(&self) -> Result<()> {
         Ok(self.call_function("removeItem", ())?)
     }

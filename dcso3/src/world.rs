@@ -11,6 +11,11 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Bindings to the DCS `world` singleton.
+//!
+//! [`World`] registers event handlers, searches for objects in a volume,
+//! removes junk, and lists airbases and map mark panels.
+
 use super::{as_tbl, event::Event, unit::Unit, wrap_f, String};
 use crate::{
     airbase::Airbase,
@@ -27,20 +32,29 @@ use mlua::{prelude::*, Value};
 use serde_derive::{Deserialize, Serialize};
 use std::ops::Deref;
 
+/// A volume of space for [`World::search_objects`] and
+/// [`World::remove_junk`]. Converted to the DCS volume table
+/// `{id = world.VolumeType value, params = {...}}`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SearchVolume {
+    /// A line segment between two points
     Segment {
         from: LuaVec3,
         to: LuaVec3,
     },
+    /// An axis aligned box with opposite corners `min` and `max`
     Box {
         min: LuaVec3,
         max: LuaVec3,
     },
+    /// A sphere around `point`
     Sphere {
         point: LuaVec3,
         radius: f64,
     },
+    /// A pyramid with its apex at `pos`, pointing along the orientation of
+    /// `pos`, extending `length` with the given horizontal and vertical
+    /// half angles
     Pyramid {
         pos: Position3,
         length: f32,
@@ -87,12 +101,15 @@ impl<'lua> IntoLua<'lua> for SearchVolume {
     }
 }
 
+/// A map mark (F10 map marker), as returned by [`World::get_mark_panels`]
 #[derive(Debug, Clone, Serialize)]
 pub struct MarkPanel<'lua> {
     pub id: MarkId,
     pub time: Time,
     pub initiator: Option<Unit<'lua>>,
+    /// Who the mark is visible to
     pub side: SideFilter,
+    /// The group the mark is visible to, `None` if not restricted to a group
     pub group_id: Option<GroupId>,
     pub text: String,
     pub pos: LuaVec3,
@@ -105,6 +122,7 @@ impl<'lua> FromLua<'lua> for MarkPanel<'lua> {
             id: tbl.raw_get("idx")?,
             time: tbl.raw_get("time")?,
             initiator: tbl.raw_get("initiator")?,
+            // DCS reports a mark visible to all as -1 or 255
             side: match tbl.raw_get::<_, i64>("coalition")? {
                 -1 | 255 => SideFilter::All,
                 0 => SideFilter::Neutral,
@@ -122,21 +140,30 @@ impl<'lua> FromLua<'lua> for MarkPanel<'lua> {
     }
 }
 
+// Identifies an event handler registered with `World::add_event_handler`.
 atomic_id!(HandlerId);
 
 impl HandlerId {
+    /// The global variable name the handler table is stored under
     fn key(&self) -> String {
         String(format_compact!("rustHandler{}", self.0))
     }
 }
 
+// The global `world` table.
 wrapped_table!(World, None);
 
 impl<'lua> World<'lua> {
+    /// Get the global `world` table
     pub fn singleton(lua: MizLua<'lua>) -> Result<Self> {
         Ok(lua.inner().globals().raw_get("world")?)
     }
 
+    /// Register `f` to be called with every DCS event. Calls
+    /// `world.addEventHandler` with a table whose `onEvent` calls `f`.
+    /// Events that fail to convert to [`Event`] are logged and skipped, and
+    /// errors and panics in `f` are logged. The returned id can be passed
+    /// to [`World::remove_event_handler`].
     pub fn add_event_handler<F>(&self, f: F) -> Result<HandlerId>
     where
         F: Fn(MizLua<'lua>, Event) -> Result<()> + 'static,
@@ -158,10 +185,15 @@ impl<'lua> World<'lua> {
                 })?,
         )?;
         self.t.call_function::<_, ()>("addEventHandler", tbl.clone())?;
+        // keep the handler table in a global so remove_event_handler can
+        // pass the same table back to DCS
         globals.raw_set(id.key(), tbl)?;
         Ok(id)
     }
 
+    /// Unregister a handler added by [`World::add_event_handler`]. Calls
+    /// `world.removeEventHandler`. Returns an error if `id` is not
+    /// registered.
     pub fn remove_event_handler(&self, id: HandlerId) -> Result<()> {
         let globals = self.lua.globals();
         let key = id.key();
@@ -172,14 +204,20 @@ impl<'lua> World<'lua> {
         Ok(())
     }
 
+    /// Calls `world.getPlayer`
     pub fn get_player(&self) -> Result<Sequence<'lua, Unit<'lua>>> {
         Ok(self.t.call_function("getPlayer", ())?)
     }
 
+    /// Every airbase in the mission. Calls `world.getAirbases`.
     pub fn get_airbases(&self) -> Result<Sequence<'lua, Airbase<'lua>>> {
         Ok(self.t.call_function("getAirbases", ())?)
     }
 
+    /// Find objects of `category` inside `volume`. Calls
+    /// `world.searchObjects`, which calls `f` with each object found and
+    /// `arg`. `f` returns true to continue the search. Errors and panics
+    /// in `f` are logged and treated as returning false.
     pub fn search_objects<F, T>(
         &self,
         category: ObjectCategory,
@@ -201,10 +239,14 @@ impl<'lua> World<'lua> {
             .call_function("searchObjects", (category, volume, f, arg))?)
     }
 
+    /// Remove debris (e.g. wreckage) inside `volume`. Calls
+    /// `world.removeJunk` and returns the number of objects it reports
+    /// removing.
     pub fn remove_junk(&self, volume: SearchVolume) -> Result<i64> {
         Ok(self.t.call_function("removeJunk", volume)?)
     }
 
+    /// Every map mark currently placed. Calls `world.getMarkPanels`.
     pub fn get_mark_panels(&self) -> Result<Sequence<'lua, MarkPanel<'lua>>> {
         Ok(self.t.call_function("getMarkPanels", ())?)
     }

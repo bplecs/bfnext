@@ -11,6 +11,12 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Bindings to the DCS `StaticObject` scripting class.
+//!
+//! Static objects are non-moving mission objects such as buildings, cargo,
+//! and FARP pads. Some static objects (e.g. FARPs) are reported by DCS as
+//! airbases, so lookups by name return a [`Static`], which can be either.
+
 use super::{as_tbl, coalition::Side, country::Country, object::Object};
 use crate::{airbase::Airbase, coalition::Static, object::{DcsObject, DcsOid}, wrapped_prim, wrapped_table, LuaEnv, MizLua};
 use anyhow::{anyhow, bail, Result};
@@ -18,11 +24,17 @@ use mlua::{prelude::*, Value};
 use serde_derive::{Serialize, Deserialize};
 use std::{marker::PhantomData, ops::Deref};
 
+// The id DCS assigns a static object, returned by `StaticObject:getID`.
 wrapped_prim!(StaticObjectId, i64, Hash, Copy);
 
+// A DCS static object.
 wrapped_table!(StaticObject, Some("StaticObject"));
 
 impl<'lua> StaticObject<'lua> {
+    /// Look up a static object by name. Calls `StaticObject.getByName`.
+    /// If the returned object's class is `Airbase` it is returned as
+    /// [`Static::Airbase`], otherwise as [`Static::Static`]. Returns an error
+    /// if nothing is found or the result has no metatable.
     pub fn get_by_name(lua: MizLua<'lua>, name: &str) -> Result<Static<'lua>> {
         let globals = lua.inner().globals();
         let sobj = as_tbl("StaticObject", None, globals.raw_get("StaticObject")?)?;
@@ -43,10 +55,13 @@ impl<'lua> StaticObject<'lua> {
         }
     }
 
+    /// Remove the static object from the mission. Calls
+    /// `StaticObject:destroy`.
     pub fn destroy(self) -> Result<()> {
         Ok(self.t.call_method("destroy", ())?)
     }
 
+    /// The object's DCS id. Calls `StaticObject:getID`.
     pub fn id(&self) -> Result<StaticObjectId> {
         Ok(self.t.call_method("getID", ())?)
     }
@@ -63,6 +78,7 @@ impl<'lua> StaticObject<'lua> {
         Ok(self.t.call_method("getCountry", ())?)
     }
  
+    /// The object's current hit points. Calls `StaticObject:getLife`.
     pub fn get_life(&self) -> Result<i64> {
         Ok(self.t.call_method("getLife", ())?)
     }
@@ -71,18 +87,25 @@ impl<'lua> StaticObject<'lua> {
         Ok(self.t.call_method("isExist", ())?)
     }
 
+    /// View this static object as a generic [`Object`]
     pub fn as_object(&self) -> Result<Object<'lua>> {
         Ok(Object::from_lua(Value::Table(self.t.clone()), self.lua)?)
     }
 
+    /// The object's description table, returned raw. Calls
+    /// `StaticObject:getDesc`.
     pub fn get_desc(&self) -> Result<mlua::Table<'lua>> {
         Ok(self.t.call_method("getDesc", ())?)
     }
 }
 
 
+/// Class marker for [`DcsOid`]s of [`StaticObject`]s
 #[derive(Debug, Clone)]
 pub struct ClassStatic;
+
+// get_instance and change_instance return an error if the object no longer
+// exists.
 
 impl<'lua> DcsObject<'lua> for StaticObject<'lua> {
     type Class = ClassStatic;

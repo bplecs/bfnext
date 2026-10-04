@@ -11,6 +11,15 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Bindings to the DCS `Object` scripting class, the base class of units,
+//! weapons, static objects, airbases, and scenery.
+//!
+//! [`Object`] wraps a generic DCS object and exposes the methods every
+//! object has. A DCS object is a Lua table carrying an `id_` field whose
+//! metatable is the object's class (`Unit`, `Weapon`, ...). [`DcsOid`]
+//! captures that id and class name so an object can be stored on the Rust
+//! side and turned back into a Lua object later via the [`DcsObject`] trait.
+
 use super::{as_tbl, cvt_err, unit::Unit, weapon::Weapon, LuaVec3, Position3, String};
 use crate::{
     check_implements, record_perf, simple_enum, static_object::StaticObject, wrapped_table, LuaEnv,
@@ -22,6 +31,10 @@ use mlua::{prelude::*, Value};
 use serde_derive::{Deserialize, Serialize};
 use std::{hash::Hash, marker::PhantomData, ops::Deref};
 
+/// A stored reference to a DCS object: its `id_` and the name of its class
+/// (`className_` of its metatable). `T` is a marker type naming the Rust
+/// wrapper class (e.g. [`ClassObject`]) and only exists at compile time.
+/// Equality, ordering, and hashing use only the id.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DcsOid<T> {
     pub(crate) id: u64,
@@ -31,6 +44,7 @@ pub struct DcsOid<T> {
 }
 
 impl<T> DcsOid<T> {
+    /// The same id with its class marker replaced by [`ClassObject`]
     pub fn erased(&self) -> DcsOid<ClassObject> {
         DcsOid {
             id: self.id,
@@ -39,6 +53,8 @@ impl<T> DcsOid<T> {
         }
     }
 
+    /// Return an error unless this object's class, looked up as a global
+    /// table by name, is `class` or inherits from it (via `parentClass_`).
     pub fn check_implements(&self, lua: MizLua, class: &str) -> Result<()> {
         let m = lua.inner().globals().raw_get(&**self.class)?;
         if !check_implements(&m, class) {
@@ -80,12 +96,22 @@ impl<T> Ord for DcsOid<T> {
     }
 }
 
+/// Class marker for [`DcsOid`]s of generic [`Object`]s
 #[derive(Debug, Clone)]
 pub struct ClassObject;
 
+/// A wrapper around a DCS object that can be converted to and from a
+/// [`DcsOid`].
+///
+/// The `_dyn` variants accept an id of any class marker and first check
+/// (via [`DcsOid::check_implements`]) that the object's DCS class implements
+/// the wrapper's class, returning an error if it does not.
 pub trait DcsObject<'lua>: Sized + Deref<Target = mlua::Table<'lua>> {
+    /// The marker type used in this wrapper's [`DcsOid`]s
     type Class: fmt::Debug + Clone;
 
+    /// Build a [`DcsOid`] from the object's `id_` field and the
+    /// `className_` of its metatable
     fn object_id(&self) -> Result<DcsOid<Self::Class>> {
         let id = self.raw_get("id_")?;
         let m = self
@@ -99,12 +125,20 @@ pub trait DcsObject<'lua>: Sized + Deref<Target = mlua::Table<'lua>> {
         })
     }
 
+    /// Reuse this wrapper's table for the object `id` by overwriting its
+    /// `id_` field in place, avoiding a new table allocation. The metatable
+    /// is not changed.
     fn change_instance(self, id: &DcsOid<Self::Class>) -> Result<Self>;
+    /// Like [`DcsObject::change_instance`] for an id of any class marker
     fn change_instance_dyn<T>(self, id: &DcsOid<T>) -> Result<Self>;
+    /// Create a new wrapper for `id`: a fresh table with `id_` set and the
+    /// metatable set to the global class table named by the id
     fn get_instance(lua: MizLua<'lua>, id: &DcsOid<Self::Class>) -> Result<Self>;
+    /// Like [`DcsObject::get_instance`] for an id of any class marker
     fn get_instance_dyn<T>(lua: MizLua<'lua>, id: &DcsOid<T>) -> Result<Self>;
 }
 
+// The DCS `Object.Category` values returned by `Object:getCategory`.
 simple_enum!(ObjectCategory, u8, [
     Void => 0,
     Unit => 1,
@@ -115,9 +149,11 @@ simple_enum!(ObjectCategory, u8, [
     Cargo => 6
 ]);
 
+// A generic DCS object. Accepts any table whose class implements `Object`.
 wrapped_table!(Object, Some("Object"));
 
 impl<'lua> Object<'lua> {
+    /// Remove the object from the mission. Calls `Object:destroy`.
     pub fn destroy(self) -> Result<()> {
         Ok(self.t.call_method("destroy", ())?)
     }
@@ -126,10 +162,13 @@ impl<'lua> Object<'lua> {
         Ok(self.t.call_method("getCategory", ())?)
     }
 
+    /// The object's description table, returned raw. Calls `Object:getDesc`.
     pub fn get_desc(&self) -> Result<mlua::Table<'lua>> {
         Ok(self.t.call_method("getDesc", ())?)
     }
 
+    /// True if the object has the DCS attribute `attr`. Calls
+    /// `Object:hasAttribute`.
     pub fn has_attribute(&self, attr: String) -> Result<bool> {
         Ok(self.t.call_method("hasAttribute", attr)?)
     }
@@ -138,14 +177,17 @@ impl<'lua> Object<'lua> {
         Ok(self.t.call_method("getName", ())?)
     }
 
+    /// The object's DCS type name (e.g. `"F-16C_50"`)
     pub fn get_type_name(&self) -> Result<String> {
         Ok(self.t.call_method("getTypeName", ())?)
     }
 
+    /// The object's position in world coordinates. Calls `Object:getPoint`.
     pub fn get_point(&self) -> Result<LuaVec3> {
         Ok(record_perf!(get_point, self.t.call_method("getPoint", ())?))
     }
 
+    /// The object's position and orientation. Calls `Object:getPosition`.
     pub fn get_position(&self) -> Result<Position3> {
         Ok(record_perf!(
             get_position,
@@ -153,6 +195,7 @@ impl<'lua> Object<'lua> {
         ))
     }
 
+    /// The object's velocity vector in m/s. Calls `Object:getVelocity`.
     pub fn get_velocity(&self) -> Result<LuaVec3> {
         Ok(record_perf!(
             get_velocity,
@@ -164,9 +207,14 @@ impl<'lua> Object<'lua> {
         Ok(self.t.call_method("inAir", ())?)
     }
 
+    /// True if the object still exists in the mission. Calls
+    /// `Object:isExist`.
     pub fn is_exist(&self) -> Result<bool> {
         Ok(self.t.call_method("isExist", ())?)
     }
+
+    // The as_* conversions fail if the object's class does not implement
+    // the target class.
 
     pub fn as_unit(&self) -> Result<Unit<'lua>> {
         Ok(Unit::from_lua(Value::Table(self.t.clone()), self.lua)?)
@@ -195,6 +243,7 @@ impl<'lua> DcsObject<'lua> for Object<'lua> {
             t,
             lua: lua.inner(),
         };
+        // the id may refer to an object that has since been destroyed
         if !t.is_exist()? {
             bail!("{} is an invalid object", id.id)
         }

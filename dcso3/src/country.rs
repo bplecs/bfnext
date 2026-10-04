@@ -11,10 +11,14 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! The DCS `country.id` enumeration.
+
 use crate::{cvt_err, simple_enum};
 use mlua::{prelude::*, Value};
 use serde_derive::{Serialize, Deserialize};
 
+// Every DCS country, with the numeric id DCS uses for it (`country.id`).
+// Variant names follow the DCS constant names, including their spellings.
 simple_enum!(Country, u8, [
     ABKHAZIA => 18,
     AGGRESSORS => 7,

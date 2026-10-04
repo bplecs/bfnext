@@ -11,6 +11,9 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Bindings to the DCS `coord` singleton, which converts between the map's
+//! local coordinate system (LO, meters), latitude/longitude (LL), and MGRS.
+
 use super::{as_tbl, String};
 use crate::{lua_err, wrapped_table, LuaEnv, LuaVec3};
 use anyhow::Result;
@@ -18,6 +21,8 @@ use mlua::{prelude::*, Value};
 use serde_derive::{Deserialize, Serialize};
 use std::ops::Deref;
 
+/// A latitude/longitude position with altitude, as returned by
+/// `coord.LOtoLL`. Latitude and longitude are in degrees.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LLPos {
     pub latitude: f64,
@@ -25,6 +30,8 @@ pub struct LLPos {
     pub altitude: f64,
 }
 
+/// An MGRS grid position. Converts to and from the DCS MGRS table
+/// (`UTMZone`, `MGRSDigraph`, `Easting`, `Northing`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MGRSPos {
     pub utm_zone: String,
@@ -56,19 +63,25 @@ impl<'lua> IntoLua<'lua> for MGRSPos {
     }
 }
 
+// The global `coord` table, obtained with `Coord::singleton`.
 wrapped_table!(Coord, None);
 
 impl<'lua> Coord<'lua> {
+    /// Get the global `coord` table. Fails if it is not present in this Lua
+    /// environment.
     pub fn singleton<L: LuaEnv<'lua>>(lua: L) -> Result<Self> {
         Ok(lua.inner().globals().raw_get("coord")?)
     }
 
+    /// Convert a lat/lon/alt position to a map position. Calls `coord.LLtoLO`.
     pub fn ll_to_lo(&self, pos: LLPos) -> Result<LuaVec3> {
         Ok(self
             .t
             .call_function("LLtoLO", (pos.latitude, pos.longitude, pos.altitude))?)
     }
 
+    /// Convert a map position to lat/lon/alt. Calls `coord.LOtoLL`, which
+    /// returns the three values separately.
     pub fn lo_to_ll(&self, pos: LuaVec3) -> Result<LLPos> {
         let (latitude, longitude, altitude) = self.t.call_function("LOtoLL", pos)?;
         Ok(LLPos {
@@ -78,10 +91,12 @@ impl<'lua> Coord<'lua> {
         })
     }
 
+    /// Convert a latitude/longitude to MGRS. Calls `coord.LLtoMGRS`.
     pub fn ll_to_mgrs(&self, latitude: f64, longitude: f64) -> Result<MGRSPos> {
         Ok(self.t.call_function("LLtoMGRS", (latitude, longitude))?)
     }
 
+    /// Convert an MGRS position to lat/lon/alt. Calls `coord.MGRStoLL`.
     pub fn mgrs_to_ll(&self, mgrs: MGRSPos) -> Result<LLPos> {
         let (latitude, longitude, altitude) = self.t.call_function("MGRStoLL", mgrs)?;
         Ok(LLPos {

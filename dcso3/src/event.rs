@@ -11,6 +11,14 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Translation of DCS mission events (`world.event`) into Rust.
+//!
+//! DCS passes event handlers a table with a numeric `id` and fields that
+//! depend on the event type. [`Event`] has one variant per DCS event id;
+//! events whose payloads are used carry a typed struct, the rest carry
+//! nothing. Handlers are registered with
+//! [`crate::world::World::add_event_handler`].
+
 use std::marker::PhantomData;
 
 use crate::{object::DcsOid, unit::ClassUnit};
@@ -24,6 +32,7 @@ use log::{error, info};
 use mlua::{prelude::*, Value};
 use serde_derive::Serialize;
 
+/// Where a unit was born. Not currently produced by event translation.
 #[derive(Debug, Clone, Serialize)]
 pub enum BirthPlace {
     Air,
@@ -33,6 +42,7 @@ pub enum BirthPlace {
     HeliportCold,
 }
 
+/// Payload of the shot event: `initiator` released `weapon`
 #[derive(Debug, Clone, Serialize)]
 pub struct Shot<'lua> {
     pub time: Time,
@@ -53,6 +63,8 @@ impl<'lua> FromLua<'lua> for Shot<'lua> {
     }
 }
 
+/// Payload of the shooting end event, sent when a unit stops firing (the
+/// counterpart of shooting start)
 #[derive(Debug, Clone, Serialize)]
 pub struct ShootingEnd<'lua> {
     pub time: Time,
@@ -71,6 +83,8 @@ impl<'lua> FromLua<'lua> for ShootingEnd<'lua> {
     }
 }
 
+/// Payload shared by the hit, kill, and shooting start events. The
+/// initiator and target are optional because DCS may omit them.
 #[derive(Debug, Clone, Serialize)]
 pub struct WeaponUse<'lua> {
     pub time: Time,
@@ -91,6 +105,8 @@ impl<'lua> FromLua<'lua> for WeaponUse<'lua> {
     }
 }
 
+/// Payload of the player leave unit event. Only the initiator's id is kept
+/// (with the class assumed to be `Unit`), not a live [`Unit`] object.
 #[derive(Debug, Clone, Serialize)]
 pub struct LeaveUnit {
     pub initiator: Option<DcsOid<ClassUnit>>,
@@ -113,6 +129,7 @@ impl<'lua> FromLua<'lua> for LeaveUnit {
     }
 }
 
+/// Payload of events that only carry a time and an optional initiator
 #[derive(Debug, Clone, Serialize)]
 pub struct UnitEvent<'lua> {
     pub time: Time,
@@ -126,6 +143,7 @@ impl<'lua> FromLua<'lua> for UnitEvent<'lua> {
     }
 }
 
+/// Payload of the ejection event
 #[derive(Debug, Clone, Serialize)]
 pub struct EjectionEvent<'lua> {
     pub time: Time,
@@ -144,6 +162,8 @@ impl<'lua> FromLua<'lua> for EjectionEvent<'lua> {
     }
 }
 
+/// Payload of the birth event, sent when a unit spawns. `place` is where it
+/// spawned, if anywhere, and `subplace` is DCS's `subPlace` field.
 #[derive(Debug, Clone, Serialize)]
 pub struct Birth<'lua> {
     pub time: Time,
@@ -164,6 +184,9 @@ impl<'lua> FromLua<'lua> for Birth<'lua> {
     }
 }
 
+/// Payload of events that happen at a place, such as takeoff, landing, and
+/// engine startup and shutdown. `place` is where it happened, if DCS
+/// reports one.
 #[derive(Debug, Clone, Serialize)]
 pub struct AtPlace<'lua> {
     pub time: Time,
@@ -184,6 +207,7 @@ impl<'lua> FromLua<'lua> for AtPlace<'lua> {
     }
 }
 
+/// Payload of the weapon add event
 #[derive(Debug, Clone, Serialize)]
 pub struct WeaponAdd<'lua> {
     pub time: Time,
@@ -203,6 +227,9 @@ impl<'lua> FromLua<'lua> for WeaponAdd<'lua> {
 }
 
 /// This is a dcs event
+///
+/// Variants are in DCS `world.event` id order (0 to 57); see `translate`
+/// for the mapping.
 #[derive(Debug, Clone, Serialize)]
 pub enum Event<'lua> {
     Invalid,
@@ -265,6 +292,9 @@ pub enum Event<'lua> {
     Max,
 }
 
+/// Convert the event table `value` with event id `id` into an [`Event`].
+/// Fails if the id is unknown or the payload doesn't have the expected
+/// fields.
 fn translate<'a, 'lua: 'a>(
     lua: &'lua Lua,
     id: i64,
@@ -326,6 +356,7 @@ fn translate<'a, 'lua: 'a>(
         52 => Event::MacExtraScore,
         53 => Event::MissionRestart,
         54 => {
+            // the payload isn't translated, so log it
             info!("mission winner event {}", value_to_json(&value));
             Event::MissionWinner
         }
@@ -336,6 +367,8 @@ fn translate<'a, 'lua: 'a>(
     })
 }
 
+/// Translation failures are logged along with the raw event table before
+/// the error is returned.
 impl<'lua> FromLua<'lua> for Event<'lua> {
     fn from_lua(value: Value<'lua>, lua: &'lua Lua) -> LuaResult<Self> {
         let id = as_tbl_ref("Event", &value).map_err(lua_err)?.raw_get("id")?;

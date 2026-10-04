@@ -11,12 +11,21 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Bindings to the DCS `timer` singleton: mission time and scheduled
+//! functions.
+//!
+//! [`Timer::schedule_function`] registers a Rust closure with
+//! `timer.scheduleFunction`; it is the main way to run code periodically
+//! from the mission scripting environment.
+
 use crate::{as_tbl, cvt_err, record_perf, wrap_f, wrapped_table, LuaEnv, MizLua, Time};
 use anyhow::Result;
 use mlua::{prelude::*, Value};
 use serde_derive::Serialize;
 use std::ops::Deref;
 
+/// The id DCS returns for a scheduled function, used to remove or
+/// reschedule it
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct FunId(i64);
 
@@ -35,13 +44,17 @@ impl<'lua> IntoLua<'lua> for FunId {
     }
 }
 
+// The global `timer` table.
 wrapped_table!(Timer, None);
 
 impl<'lua> Timer<'lua> {
+    /// Get the global `timer` table
     pub fn singleton(lua: MizLua<'lua>) -> Result<Self> {
         Ok(lua.inner().globals().raw_get("timer")?)
     }
 
+    /// Mission time in seconds since the mission started. Calls
+    /// `timer.getTime`.
     pub fn get_time(&self) -> Result<Time> {
         Ok(record_perf!(
             timer_get_time,
@@ -49,6 +62,8 @@ impl<'lua> Timer<'lua> {
         ))
     }
 
+    /// Absolute mission time in seconds (time of day in the mission). Calls
+    /// `timer.getAbsTime`.
     pub fn get_abs_time(&self) -> Result<Time> {
         Ok(record_perf!(
             timer_get_abs_time,
@@ -56,6 +71,8 @@ impl<'lua> Timer<'lua> {
         ))
     }
 
+    /// The absolute time at which the mission started. Calls
+    /// `timer.getTime0`.
     pub fn get_time0(&self) -> Result<Time> {
         Ok(record_perf!(
             timer_get_time0,
@@ -63,6 +80,13 @@ impl<'lua> Timer<'lua> {
         ))
     }
 
+    /// Schedule `f` to run at mission time `when` (see
+    /// [`Timer::get_time`]). Calls `timer.scheduleFunction`.
+    ///
+    /// `f` is called with `arg` and the current time. Its return value is
+    /// handed back to DCS: `Some(t)` reschedules it to run again at time
+    /// `t`, `None` stops it. An error or panic in `f` is logged and treated
+    /// as `None`.
     pub fn schedule_function<T, F>(&self, when: Time, arg: T, f: F) -> Result<FunId>
     where
         F: Fn(MizLua, T, Time) -> Result<Option<Time>> + 'static,
@@ -71,6 +95,8 @@ impl<'lua> Timer<'lua> {
         let f = self
             .lua
             .create_function(move |lua, (arg, time): (T, Time)| {
+                // wrap_f logs errors and returns the default (None) so a
+                // failing callback doesn't raise a Lua error inside DCS
                 wrap_f("scheduled function", MizLua(lua), |lua| f(lua, arg, time))
             })?;
         Ok(record_perf!(
@@ -79,6 +105,7 @@ impl<'lua> Timer<'lua> {
         ))
     }
 
+    /// Cancel a scheduled function. Calls `timer.removeFunction`.
     pub fn remove_function(&self, id: FunId) -> Result<()> {
         Ok(record_perf!(
             timer_remove_function,
@@ -86,6 +113,9 @@ impl<'lua> Timer<'lua> {
         ))
     }
 
+    /// Intended to change when a scheduled function next runs
+    /// (`timer.setFunctionTime`), but note that it currently calls
+    /// `timer.removeFunction`.
     pub fn set_function_time(&self, id: FunId, when: f64) -> Result<()> {
         Ok(record_perf!(
             timer_remove_function,

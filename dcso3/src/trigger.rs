@@ -11,6 +11,18 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Bindings to the DCS `trigger` mission scripting API.
+//!
+//! [`Trigger`] wraps the global `trigger` table. Its `action` sub table,
+//! wrapped by [`Action`], holds the functions that make things happen:
+//! user flags, on screen text and sounds, smoke, flares, illumination
+//! bombs, explosions, radio transmissions, and F10 map marks and drawn
+//! shapes (lines, circles, rectangles, quads, text, arrows) along with
+//! the `setMarkup*` functions that modify existing shapes. The `misc`
+//! sub table is used only for [`Trigger::get_zone`].
+//!
+//! Marks and shapes are identified by a caller chosen [`MarkId`].
+
 use crate::{
     as_tbl, atomic_id,
     coalition::Side,
@@ -23,8 +35,11 @@ use mlua::{prelude::*, Value};
 use serde_derive::{Deserialize, Serialize};
 use std::ops::Deref;
 
+// The id of an F10 map mark or drawn shape. Allocate new ids with
+// `MarkId::new()`.
 atomic_id!(MarkId);
 
+/// A circular trigger zone as returned by `trigger.misc.getZone`
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Zone {
     pub point: LuaVec3,
@@ -52,6 +67,7 @@ impl<'lua> IntoLua<'lua> for Zone {
     }
 }
 
+// Smoke marker colors for `Action::smoke` (`trigger.smokeColor`).
 simple_enum!(SmokeColor, u8, [
     Green => 0,
     Red => 1,
@@ -60,6 +76,7 @@ simple_enum!(SmokeColor, u8, [
     Blue => 4
 ]);
 
+// The effect presets for `Action::effect_smoke_big`.
 simple_enum!(SmokePreset, u8, [
     SmallSmokeAndFire => 1,
     MediumSmokeAndFire => 2,
@@ -71,6 +88,7 @@ simple_enum!(SmokePreset, u8, [
     HugeSmoke => 8
 ]);
 
+// Signal flare colors for `Action::signal_flare` (`trigger.flareColor`).
 simple_enum!(FlareColor, u8, [
     Green => 0,
     Red => 1,
@@ -78,11 +96,14 @@ simple_enum!(FlareColor, u8, [
     Yellow => 3
 ]);
 
+// Radio modulation for `Action::radio_transmission`.
 simple_enum!(Modulation, u8, [
     AM => 0,
     FM => 1
 ]);
 
+// Who can see a drawn shape: one coalition, or everyone (-1). The first
+// argument of the `*ToAll` shape functions.
 simple_enum!(SideFilter, i8, [
     All => -1,
     Neutral => 0,
@@ -91,6 +112,7 @@ simple_enum!(SideFilter, i8, [
 ]);
 
 impl SideFilter {
+    /// True if a shape drawn with this filter is meant for `side`
     pub fn is_match(&self, side: &Side) -> bool {
         match (self, side) {
             (Self::All, _) => true,
@@ -112,6 +134,7 @@ impl From<Side> for SideFilter {
     }
 }
 
+// The outline style of a drawn shape.
 simple_enum!(LineType, u8, [
     NoLine => 0,
     Solid => 1,
@@ -122,15 +145,18 @@ simple_enum!(LineType, u8, [
     TwoDash => 6
 ]);
 
+/// The arguments of [`Action::line_to_all`]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct LineSpec {
     pub start: LuaVec3,
     pub end: LuaVec3,
     pub color: Color,
     pub line_type: LineType,
+    /// If true players can't remove the shape
     pub read_only: bool,
 }
 
+/// The arguments of [`Action::circle_to_all`]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CircleSpec {
     pub center: LuaVec3,
@@ -141,6 +167,8 @@ pub struct CircleSpec {
     pub read_only: bool,
 }
 
+/// The arguments of [`Action::rect_to_all`]; `start` and `end` are opposite
+/// corners
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RectSpec {
     pub start: LuaVec3,
@@ -151,6 +179,7 @@ pub struct RectSpec {
     pub read_only: bool,
 }
 
+/// The arguments of [`Action::quad_to_all`], a four sided polygon
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct QuadSpec {
     pub p0: LuaVec3,
@@ -163,6 +192,7 @@ pub struct QuadSpec {
     pub read_only: bool,
 }
 
+/// The arguments of [`Action::text_to_all`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextSpec {
     pub pos: LuaVec3,
@@ -173,6 +203,7 @@ pub struct TextSpec {
     pub text: String,
 }
 
+/// The arguments of [`Action::arrow_to_all`]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ArrowSpec {
     pub start: LuaVec3,
@@ -183,9 +214,12 @@ pub struct ArrowSpec {
     pub read_only: bool,
 }
 
+// The `trigger.action` table. Each method calls the DCS function of the same
+// (camel case) name.
 wrapped_table!(Action, None);
 
 impl<'lua> Action<'lua> {
+    /// Set user flag `key` to `value` (`trigger.action.setUserFlag`)
     pub fn set_user_flag<K: IntoLua<'lua>, V: IntoLua<'lua>>(
         &self,
         key: K,
@@ -194,18 +228,24 @@ impl<'lua> Action<'lua> {
         Ok(self.call_function("setUserFlag", (key, value))?)
     }
 
+    /// Run the triggered action number `num` of a group (`setAITask`)
     pub fn set_ai_task(&self, group: GroupId, num: i64) -> Result<()> {
         Ok(self.call_function("setAITask", (group, num))?)
     }
 
+    /// Create an explosion of strength `power` at `position`
     pub fn explosion(&self, position: LuaVec3, power: f32) -> Result<()> {
         Ok(self.call_function("explosion", (position, power))?)
     }
 
+    /// Create a colored smoke marker at `position`
     pub fn smoke(&self, position: LuaVec3, color: SmokeColor) -> Result<()> {
         Ok(self.call_function("smoke", (position, color))?)
     }
 
+    /// Start a large smoke (and optionally fire) effect at `position`
+    /// (`effectSmokeBig`). `name` identifies it for
+    /// [`Action::effect_smoke_stop`].
     pub fn effect_smoke_big(
         &self,
         position: LuaVec3,
@@ -216,18 +256,24 @@ impl<'lua> Action<'lua> {
         Ok(self.call_function("effectSmokeBig", (position, preset, density, name))?)
     }
 
+    /// Stop the smoke effect started with `name`
     pub fn effect_smoke_stop(&self, name: String) -> Result<()> {
         Ok(self.call_function("effectSmokeStop", name)?)
     }
 
+    /// Fire an illumination bomb at `position` (`illuminationBomb`)
     pub fn illumination_bomb(&self, position: LuaVec3, power: f32) -> Result<()> {
         Ok(self.call_function("illuminationBomb", (position, power))?)
     }
 
+    /// Fire a signal flare from `position` toward `azimuth` (`signalFlare`)
     pub fn signal_flare(&self, position: LuaVec3, color: FlareColor, azimuth: u16) -> Result<()> {
         Ok(self.call_function("signalFlare", (position, color, azimuth))?)
     }
 
+    /// Transmit the sound `file` from `origin` on `frequency`
+    /// (`radioTransmission`). If `repeat` is true it loops. `name`
+    /// identifies the transmission for [`Action::stop_transmission`].
     pub fn radio_transmission(
         &self,
         file: String,
@@ -244,13 +290,20 @@ impl<'lua> Action<'lua> {
         )?)
     }
 
+    /// Stop the radio transmission started with `name`
+    /// (`stopRadioTransmission`)
     pub fn stop_transmission(&self, name: String) -> Result<()> {
         Ok(self.call_function("stopRadioTransmission", name)?)
     }
 
+    /// Set the internal cargo mass carried by the unit called `unit_name`
+    /// (`setUnitInternalCargo`)
     pub fn set_unit_internal_cargo(&self, unit_name: String, mass: i64) -> Result<()> {
         Ok(self.call_function("setUnitInternalCargo", (unit_name, mass))?)
     }
+
+    // The out_sound* functions play the sound `file` to everyone, or to the
+    // given coalition, country, group, or unit.
 
     pub fn out_sound(&self, file: String) -> Result<()> {
         Ok(self.call_function("outSound", file)?)
@@ -271,6 +324,10 @@ impl<'lua> Action<'lua> {
     pub fn out_sound_for_unit(&self, unit: UnitId, file: String) -> Result<()> {
         Ok(self.call_function("outSoundForUnit", (unit, file))?)
     }
+
+    // The out_text* functions show `text` on screen for `display_time`
+    // seconds to everyone, or to the given coalition, country, group, or
+    // unit. `clear_view` is passed through as DCS's `clearview` argument.
 
     pub fn out_text(&self, text: String, display_time: i64, clear_view: bool) -> Result<()> {
         Ok(self.call_function("outText", (text, display_time, clear_view))?)
@@ -322,6 +379,10 @@ impl<'lua> Action<'lua> {
         Ok(self.call_function("outTextForUnit", (unit, text, display_time, clear_view))?)
     }
 
+    // The mark_to_* functions place an F10 map mark with label `text` at
+    // `position`, visible to everyone, one coalition, or one group.
+    // `message`, if given, is shown when the mark is added.
+
     pub fn mark_to_all(
         &self,
         id: MarkId,
@@ -363,9 +424,15 @@ impl<'lua> Action<'lua> {
         )?)
     }
 
+    /// Remove the mark or drawn shape `id` (`removeMark`)
     pub fn remove_mark(&self, id: MarkId) -> Result<()> {
         Ok(self.call_function("removeMark", id)?)
     }
+
+    // The *_to_all shape functions draw on the F10 map for the coalitions
+    // selected by `side`. The spec struct fields are passed in the
+    // positional order DCS expects. `message`, if given, is shown when the
+    // shape is added.
 
     pub fn line_to_all(
         &self,
@@ -460,6 +527,8 @@ impl<'lua> Action<'lua> {
         )?)
     }
 
+    /// Draw text on the F10 map. Unlike the other shapes it takes no
+    /// `message`; DCS takes the text in that position.
     pub fn text_to_all(&self, side: SideFilter, id: MarkId, spec: TextSpec) -> Result<()> {
         Ok(self.call_function(
             "textToAll",
@@ -499,6 +568,9 @@ impl<'lua> Action<'lua> {
         )?)
     }
 
+    // The set_markup_* functions modify an existing drawn shape `id` in
+    // place.
+
     pub fn set_markup_radius(&self, id: MarkId, radius: f64) -> Result<()> {
         Ok(self.call_function("setMarkupRadius", (id, radius))?)
     }
@@ -532,17 +604,23 @@ impl<'lua> Action<'lua> {
     }
 }
 
+// The global `trigger` table.
 wrapped_table!(Trigger, None);
 
 impl<'lua> Trigger<'lua> {
+    /// Get the global `trigger` table. Mission environment only.
     pub fn singleton(lua: MizLua<'lua>) -> Result<Self> {
         Ok(lua.inner().globals().raw_get("trigger")?)
     }
 
+    /// The `trigger.action` table
     pub fn action(&self) -> Result<Action<'lua>> {
         Ok(self.raw_get("action")?)
     }
 
+    /// Look up the trigger zone called `name` (`trigger.misc.getZone`).
+    /// Returns an error if DCS doesn't return a zone table (e.g. no such
+    /// zone).
     pub fn get_zone(&self, name: String) -> Result<Zone> {
         let misc: LuaTable = self.t.raw_get("misc")?;
         Ok(misc.call_function("getZone", name)?)

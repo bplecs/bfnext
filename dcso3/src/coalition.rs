@@ -11,6 +11,12 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Bindings to the DCS `coalition` singleton.
+//!
+//! [`Side`] is the DCS coalition (`coalition.side`). [`Coalition`] wraps the
+//! global `coalition` table, which spawns groups and static objects and
+//! lists the groups, statics, airbases, and players belonging to a side.
+
 use super::{
     airbase::Airbase,
     as_tbl,
@@ -26,6 +32,7 @@ use mlua::{prelude::*, Value};
 use serde_derive::{Deserialize, Serialize};
 use std::{fmt, ops::Deref, str::FromStr};
 
+// A DCS coalition, numbered as in `coalition.side`.
 simple_enum!(Side, u8, [Neutral => 0, Red => 1, Blue => 2]);
 
 impl Default for Side {
@@ -40,6 +47,7 @@ impl fmt::Display for Side {
     }
 }
 
+/// Parses the names produced by [`Side::to_str`]
 impl FromStr for Side {
     type Err = anyhow::Error;
 
@@ -54,8 +62,11 @@ impl FromStr for Side {
 }
 
 impl Side {
+    /// Every side
     pub const ALL: [Side; 3] = [Side::Red, Side::Blue, Side::Neutral];
 
+    /// The lowercase side name, `"blue"`, `"red"`, or `"neutrals"`, the
+    /// same names used as coalition keys in the mission file
     pub fn to_str(&self) -> &'static str {
         match self {
             Side::Blue => "blue",
@@ -64,6 +75,8 @@ impl Side {
         }
     }
 
+    /// The enemy side: red for blue and vice versa. Neutral is its own
+    /// opposite.
     pub fn opposite(&self) -> Side {
         match self {
             Self::Blue => Self::Red,
@@ -73,16 +86,22 @@ impl Side {
     }
 }
 
+/// A static object as returned by DCS, which may be an airbase (e.g. a
+/// FARP) or an ordinary static object, distinguished by the object's class
 #[derive(Debug, Clone)]
 pub enum Static<'lua> {
     Airbase(Airbase<'lua>),
     Static(StaticObject<'lua>),
 }
 
+// The services a unit can provide to its coalition (`coalition.service`),
+// used with `Coalition::get_service_providers`.
 simple_enum!(Service, u8, [Atc => 0, Awacs => 1, Fac => 3, Tanker => 2]);
+// The global `coalition` table.
 wrapped_table!(Coalition, None);
 
 impl<'lua> Coalition<'lua> {
+    /// Get the global `coalition` table
     pub fn singleton(lua: MizLua<'lua>) -> Result<Self> {
         Ok(Self {
             t: lua.inner().globals().raw_get("coalition")?,
@@ -90,6 +109,8 @@ impl<'lua> Coalition<'lua> {
         })
     }
 
+    /// Spawn a group for `country` from the mission-format group table
+    /// `data`. Calls `coalition.addGroup`.
     pub fn add_group(
         &self,
         country: Country,
@@ -103,6 +124,10 @@ impl<'lua> Coalition<'lua> {
         ))
     }
 
+    /// Spawn a static object for `country` from the mission-format unit
+    /// table `data`. Calls `coalition.addStaticObject`. The result is
+    /// [`Static::Airbase`] if DCS returns an object of class `Airbase`,
+    /// otherwise [`Static::Static`].
     pub fn add_static_object(
         &self,
         country: Country,
@@ -128,22 +153,28 @@ impl<'lua> Coalition<'lua> {
         }
     }
 
+    /// All groups of `side`. Calls `coalition.getGroups`.
     pub fn get_groups(&self, side: Side) -> Result<Sequence<'lua, Group<'lua>>> {
         Ok(self.t.call_function("getGroups", side)?)
     }
 
+    /// All static objects of `side`. Calls `coalition.getStaticObjects`.
     pub fn get_static_objects(&self, side: Side) -> Result<Sequence<'lua, StaticObject<'lua>>> {
         Ok(self.t.call_function("getStaticObjects", side)?)
     }
 
+    /// All airbases of `side`. Calls `coalition.getAirbases`.
     pub fn get_airbases(&self, side: Side) -> Result<Sequence<'lua, Airbase<'lua>>> {
         Ok(self.t.call_function("getAirbases", side)?)
     }
 
+    /// The units of `side` occupied by players. Calls `coalition.getPlayers`.
     pub fn get_players(&self, side: Side) -> Result<Sequence<'lua, Unit<'lua>>> {
         Ok(self.t.call_function("getPlayers", side)?)
     }
 
+    /// The units of `side` providing `service`. Calls
+    /// `coalition.getServiceProviders`.
     pub fn get_service_providers(
         &self,
         side: Side,
@@ -154,6 +185,7 @@ impl<'lua> Coalition<'lua> {
             .call_function("getServiceProviders", (side, service))?)
     }
 
+    /// The side `country` belongs to. Calls `coalition.getCountrySide`.
     pub fn get_country_coalition(&self, country: Country) -> Result<Side> {
         Ok(self.t.call_function("getCountrySide", country)?)
     }

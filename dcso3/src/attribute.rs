@@ -11,6 +11,13 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! DCS object attributes.
+//!
+//! DCS classifies object types with string attributes (e.g. `"Tanks"`,
+//! `"SAM SR"`), which can be tested with `Object:hasAttribute` and appear in
+//! object descriptions. [`Attribute`] names the known ones and
+//! [`Attributes`] is a table of attribute flags.
+
 use super::{as_tbl, String};
 use crate::{wrapped_table, string_enum};
 use anyhow::Result;
@@ -18,6 +25,8 @@ use mlua::{prelude::*, Value};
 use serde_derive::{Serialize, Deserialize};
 use std::ops::Deref;
 
+// A DCS attribute name. Attribute strings not listed here convert to
+// `Attribute::Custom`.
 string_enum!(Attribute, u8, [
     PlaneCarrier => "plane_carrier",
     NoTailTrail => "no_tail_trail",
@@ -127,9 +136,12 @@ string_enum!(Attribute, u8, [
     Missile => "Missile"
 ]);
 
+// A table mapping attribute name to a boolean flag. Used, for example, by
+// the radio usage options in `controller`.
 wrapped_table!(Attributes, None);
 
 impl<'lua> Attributes<'lua> {
+    /// Create an empty attribute table
     pub fn new(lua: &'lua Lua) -> Result<Self> {
         Ok(Self {
             t: lua.create_table()?,
@@ -137,10 +149,12 @@ impl<'lua> Attributes<'lua> {
         })
     }
 
+    /// The flag for `attr`. A missing attribute reads as `false`.
     pub fn get(&self, attr: Attribute) -> Result<bool> {
         Ok(self.t.get(attr)?)
     }
 
+    /// Set the flag for `attr`
     pub fn set(&self, attr: Attribute, val: bool) -> Result<()> {
         Ok(self.t.set(attr, val)?)
     }

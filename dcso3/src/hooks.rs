@@ -11,6 +11,19 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Registration of DCS server/GUI hook callbacks.
+//!
+//! In the hooks environment DCS calls user callbacks such as
+//! `onMissionLoadEnd`, `onSimulationFrame`, `onPlayerTryConnect` and
+//! `onPlayerTryChangeSlot` from a table passed to
+//! `DCS.setUserCallbacks`. [`UserHooks`] is a builder for that table: set
+//! the callbacks you want with its `on_*` methods, then call
+//! [`UserHooks::register`].
+//!
+//! Each callback is wrapped with [`wrap_f`], so an error or panic in the
+//! Rust callback is logged and the callback returns the default value of
+//! its return type to DCS instead of raising a Lua error.
+
 extern crate nalgebra as na;
 use crate::{
     coalition::Side,
@@ -20,6 +33,8 @@ use crate::{
 use anyhow::Result;
 use mlua::prelude::*;
 
+/// A builder for the DCS user callbacks table. Each field holds the Lua
+/// function for one callback, `None` if it isn't set.
 #[derive(Debug)]
 pub struct UserHooks<'lua> {
     on_mission_load_begin: Option<mlua::Function<'lua>>,
@@ -42,6 +57,7 @@ pub struct UserHooks<'lua> {
 }
 
 impl<'lua> UserHooks<'lua> {
+    /// An empty set of hooks, with no callbacks set
     pub fn new(lua: HooksLua<'lua>) -> Self {
         Self {
             on_mission_load_begin: None,
@@ -64,7 +80,12 @@ impl<'lua> UserHooks<'lua> {
         }
     }
 
+    /// Build a table of the callbacks that are set and pass it to
+    /// `DCS.setUserCallbacks`. The callbacks are taken out of `self`, so a
+    /// second call registers only callbacks set since the first.
     pub fn register(&mut self) -> Result<()> {
+        // destructure so that adding a field without registering it is a
+        // compile error
         let Self {
             on_mission_load_begin,
             on_mission_load_progress,
@@ -137,6 +158,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(dcs.call_function("setUserCallbacks", tbl)?)
     }
 
+    /// Set the `onMissionLoadBegin` callback
     pub fn on_mission_load_begin<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua) -> Result<()> + 'static,
@@ -149,6 +171,8 @@ impl<'lua> UserHooks<'lua> {
     }
 
     /// f(progress, message)
+    ///
+    /// Set the `onMissionLoadProgress` callback
     pub fn on_mission_load_progress<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua, String, String) -> Result<()> + 'static,
@@ -163,6 +187,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onMissionLoadEnd` callback
     pub fn on_mission_load_end<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua) -> Result<()> + 'static,
@@ -174,6 +199,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onSimulationStart` callback
     pub fn on_simulation_start<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua) -> Result<()> + 'static,
@@ -185,6 +211,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onSimulationStop` callback
     pub fn on_simulation_stop<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua) -> Result<()> + 'static,
@@ -196,6 +223,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onSimulationFrame` callback, called by DCS every frame
     pub fn on_simulation_frame<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua) -> Result<()> + 'static,
@@ -207,6 +235,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onSimulationPause` callback
     pub fn on_simulation_pause<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua) -> Result<()> + 'static,
@@ -218,6 +247,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onSimulationResume` callback
     pub fn on_simulation_resume<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua) -> Result<()> + 'static,
@@ -229,6 +259,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onPlayerConnect` callback, f(id)
     pub fn on_player_connect<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua, PlayerId) -> Result<()> + 'static,
@@ -239,6 +270,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onPlayerDisconnect` callback, f(id)
     pub fn on_player_disconnect<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua, PlayerId) -> Result<()> + 'static,
@@ -249,6 +281,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onPlayerStart` callback, f(id)
     pub fn on_player_start<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua, PlayerId) -> Result<()> + 'static,
@@ -259,6 +292,7 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onPlayerStop` callback, f(id)
     pub fn on_player_stop<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua, PlayerId) -> Result<()> + 'static,
@@ -269,6 +303,8 @@ impl<'lua> UserHooks<'lua> {
         Ok(self)
     }
 
+    /// Set the `onPlayerChangeSlot` callback, f(id), called after a player
+    /// has changed slot
     pub fn on_player_change_slot<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua, PlayerId) -> Result<()> + 'static,
@@ -281,6 +317,11 @@ impl<'lua> UserHooks<'lua> {
 
     /// f(addr, ucid, name, id), return `None` to accept the player,
     /// return `Some("reason for rejection")` to reject the player.
+    ///
+    /// Set the `onPlayerTryConnect` callback. Note `f` is actually called
+    /// with the arguments in the order (addr, name, ucid, id), as the
+    /// signature shows. `None` returns `true` to DCS, `Some(reason)` returns
+    /// `false, reason`. If `f` fails nothing is returned.
     pub fn on_player_try_connect<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua, String, String, Ucid, PlayerId) -> Result<Option<String>> + 'static,
@@ -305,6 +346,11 @@ impl<'lua> UserHooks<'lua> {
     }
 
     /// f(id, message, all)
+    ///
+    /// Set the `onPlayerTrySendChat` callback. `Some(msg)` is returned to
+    /// DCS as the message to send instead, so `Some("")` suppresses it.
+    /// `None` (also the result if `f` fails) returns nothing, letting DCS
+    /// and other hook scripts process the message unchanged.
     pub fn on_player_try_send_chat<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua, PlayerId, String, bool) -> Result<Option<String>> + 'static,
@@ -320,6 +366,12 @@ impl<'lua> UserHooks<'lua> {
     }
 
     /// f(id, message, all)
+    ///
+    /// Set the `onPlayerTryChangeSlot` callback. Despite the line above, `f`
+    /// is called with (id, side, slot), the slot the player wants. Return
+    /// `Some(false)` to deny the change; `Some(b)` is returned to DCS as
+    /// `b`. `None` (also the result if `f` fails) returns nothing, leaving
+    /// the decision to DCS and other hook scripts.
     pub fn on_player_try_change_slot<F>(&mut self, f: F) -> Result<&mut Self>
     where
         F: Fn(HooksLua, PlayerId, Side, SlotId) -> Result<Option<bool>> + 'static,

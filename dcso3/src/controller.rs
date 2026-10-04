@@ -11,6 +11,23 @@ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE.
 */
 
+//! Bindings to the DCS `Controller` API, which drives the AI of a group or
+//! unit.
+//!
+//! A [`Controller`] accepts three kinds of instruction, each converted to
+//! and from the Lua tables DCS uses:
+//! - [`Task`]: what the AI should do (attack, orbit, follow a route via
+//!   [`Task::Mission`], etc.), set with [`Controller::set_task`] or
+//!   [`Controller::push_task`].
+//! - [`Command`]: an instantaneous action (set frequency, activate a beacon,
+//!   switch waypoint, etc.), set with [`Controller::set_command`].
+//! - [`AiOption`]: a behaviour setting (ROE, reaction to threat, alarm
+//!   state, etc.), set with [`Controller::set_option`]. Options are split by
+//!   domain into [`AirOption`], [`GroundOption`], and [`NavalOption`].
+//!
+//! It also binds the detection queries ([`Controller::is_target_detected`],
+//! [`Controller::get_detected_targets`]).
+
 use super::{as_tbl, attribute::Attributes, cvt_err, object::Object, LuaVec3, String};
 use crate::{
     airbase::{AirbaseId, RunwayId},
@@ -31,6 +48,10 @@ use na::Vector2;
 use serde_derive::{Deserialize, Serialize};
 use std::{mem, ops::Deref};
 
+// The string enums below are the string values DCS uses in task and route
+// tables. Unrecognized strings become `Custom`.
+
+// The `type` of a route point (`MissionPoint`).
 string_enum!(PointType, u8, [
     TakeOffGround => "TakeOffGround",
     TakeOffGroundHot => "TakeOffGroundHot",
@@ -41,6 +62,7 @@ string_enum!(PointType, u8, [
     Nil => ""
 ]);
 
+// How much ordnance to expend per attack, the `expend` attack parameter.
 string_enum!(WeaponExpend, u8, [
     Quarter => "Quarter",
     Two => "Two",
@@ -50,16 +72,19 @@ string_enum!(WeaponExpend, u8, [
     All => "All"
 ]);
 
+// The pattern of an `Orbit` task.
 string_enum!(OrbitPattern, u8, [
     RaceTrack => "Race-Track",
     Circle => "Circle"
 ]);
 
+// The `action` of an air route point, see `ActionTyp`.
 string_enum!(TurnMethod, u8, [
     FlyOverPoint => "Fly Over Point",
     OffRoad => "Off Road"
 ]);
 
+// How a FAC designates targets, the `designation` FAC parameter.
 string_enum!(Designation, u8, [
     No => "No",
     WP => "WP",
@@ -68,11 +93,13 @@ string_enum!(Designation, u8, [
     Auto => "Auto"
 ]);
 
+// Whether an altitude is barometric or above ground (radar altimeter).
 string_enum!(AltType, u8, [
     BARO => "BARO",
     RADIO => "RADIO"
 ]);
 
+// The callsign names available to a FAC, the `callname` FAC parameter.
 simple_enum!(FACCallsign, u8, [
     Axeman	=> 1,
     Darknight => 2,
@@ -95,6 +122,15 @@ simple_enum!(FACCallsign, u8, [
     Badger => 19
 ]);
 
+/// Optional parameters shared by the attack tasks ([`Task::AttackGroup`],
+/// [`Task::Bombing`], [`Task::EngageGroup`], etc.). `None` fields are left
+/// out of the task table so DCS uses its defaults.
+///
+/// DCS gates some values behind a flag (`directionEnabled`,
+/// `altitudeEnabled`, `attackQtyLimit`); here the flag is implied by the
+/// value being `Some`. Only `weapon_type`, `expend`, `direction`,
+/// `altitude`, `attack_qty`, and `group_attack` are written to Lua; the
+/// remaining fields are only read.
 #[derive(Debug, Clone)]
 pub struct AttackParams {
     pub weapon_type: Option<u64>, // weapon flag(s)
@@ -169,6 +205,7 @@ impl<'lua> FromLua<'lua> for AttackParams {
 }
 
 impl AttackParams {
+    // write the set fields into an existing task `params` table
     fn push_tbl(&self, tbl: &LuaTable) -> LuaResult<()> {
         if let Some(wt) = self.weapon_type {
             tbl.raw_set("weaponType", wt)?
@@ -195,10 +232,16 @@ impl AttackParams {
     }
 }
 
+/// Parameters shared by the follow tasks ([`Task::Follow`],
+/// [`Task::FollowBigFormation`], [`Task::Escort`]).
 #[derive(Debug, Clone)]
 pub struct FollowParams {
+    /// The group to follow
     pub group: GroupId,
+    /// The position to hold relative to the followed group
     pub pos: LuaVec3,
+    /// If set, stop following when the followed group reaches this
+    /// waypoint (DCS `lastWptIndex`, gated by `lastWptIndexFlag`)
     pub last_waypoint_index: Option<i64>,
 }
 
@@ -218,6 +261,7 @@ impl<'lua> FromLua<'lua> for FollowParams {
 }
 
 impl FollowParams {
+    // write the fields into an existing task `params` table
     fn push_tbl(&self, tbl: &LuaTable) -> LuaResult<()> {
         tbl.raw_set("groupId", self.group)?;
         tbl.raw_set("pos", self.pos)?;
@@ -229,6 +273,9 @@ impl FollowParams {
     }
 }
 
+/// Optional parameters shared by the FAC tasks ([`Task::FAC`],
+/// [`Task::FACAttackGroup`], [`Task::FACEngageGroup`]). `None` fields are
+/// left out of the task table.
 #[derive(Debug, Clone)]
 pub struct FACParams {
     pub weapon_type: Option<u64>, // weapon flag(s),
@@ -256,6 +303,7 @@ impl<'lua> FromLua<'lua> for FACParams {
 }
 
 impl FACParams {
+    // write the set fields into an existing task `params` table
     fn push_tbl(&self, tbl: &LuaTable) -> LuaResult<()> {
         if let Some(wt) = self.weapon_type {
             tbl.raw_set("weaponType", wt)?;
@@ -282,6 +330,8 @@ impl FACParams {
     }
 }
 
+/// The `action` of a route point. Air and ground routes use different
+/// strings, so this holds either a [`TurnMethod`] or a [`VehicleFormation`].
 #[derive(Debug, Clone)]
 pub enum ActionTyp {
     Air(TurnMethod),
@@ -299,6 +349,7 @@ impl<'lua> IntoLua<'lua> for ActionTyp {
 
 impl<'lua> FromLua<'lua> for ActionTyp {
     fn from_lua(value: Value<'lua>, lua: &'lua Lua) -> LuaResult<Self> {
+        // try the air form first, then the ground form
         match TurnMethod::from_lua(value.clone(), lua) {
             Ok(v) => Ok(Self::Air(v)),
             Err(te) => match VehicleFormation::from_lua(value, lua) {
@@ -311,14 +362,21 @@ impl<'lua> FromLua<'lua> for ActionTyp {
     }
 }
 
+/// A waypoint in the route of a [`Task::Mission`]. Converts to and from the
+/// DCS route point table; `None` fields are left out of the table.
 #[derive(Debug, Clone)]
 pub struct MissionPoint<'lua> {
     pub typ: PointType,
+    /// The airbase to take off from or land at (`airdromId`)
     pub airdrome_id: Option<AirbaseId>,
+    /// DCS `timeReFuAr`
     pub time_re_fu_ar: Option<i64>,
+    /// The helipad/FARP to take off from or land at (`helipadId`)
     pub helipad: Option<AirbaseId>,
+    /// The unit to take off from or land on, such as a carrier (`linkUnit`)
     pub link_unit: Option<UnitId>,
     pub action: Option<ActionTyp>,
+    /// Position on the map, stored as the point's `x` and `y` fields
     pub pos: LuaVec2,
     pub alt: f64,
     pub alt_typ: Option<AltType>,
@@ -327,6 +385,7 @@ pub struct MissionPoint<'lua> {
     pub eta: Option<Time>,
     pub eta_locked: Option<bool>,
     pub name: Option<String>,
+    /// The task performed at this waypoint (often a [`Task::ComboTask`])
     pub task: Box<Task<'lua>>,
 }
 
@@ -374,11 +433,14 @@ impl<'lua> IntoLua<'lua> for MissionPoint<'lua> {
             ("task", self.task.into_lua(lua)?),
         ]
         .into_iter()
+        // omit unset optional fields rather than storing nils
         .filter(|(_, v)| !v.is_nil());
         Ok(Value::Table(lua.create_table_from(iter)?))
     }
 }
 
+/// The start condition of a [`Task::ControlledTask`]. Each field is an
+/// optional condition; `None` fields are left out of the table.
 #[derive(Debug, Clone)]
 pub struct TaskStartCond<'lua> {
     pub time: Option<Time>,
@@ -416,6 +478,8 @@ impl<'lua> IntoLua<'lua> for TaskStartCond<'lua> {
     }
 }
 
+/// The stop condition of a [`Task::ControlledTask`]. Each field is an
+/// optional condition; `None` fields are left out of the table.
 #[derive(Debug, Clone)]
 pub struct TaskStopCond<'lua> {
     pub time: Option<Time>,
@@ -456,6 +520,22 @@ impl<'lua> IntoLua<'lua> for TaskStopCond<'lua> {
     }
 }
 
+/// An AI task, converted to and from the DCS task table
+/// `{ id = <name>, params = { ... } }`. Most variants map one to one onto a
+/// DCS task id of the same name (exceptions: `BombRunway` is
+/// `BombingRunway`, `Refuelling` is `Refueling`, `GoToWaypoint` is
+/// `goToWaypoint`, and the `FAC*` variants use `FAC_` ids).
+///
+/// Variants fall into DCS's task categories:
+/// - en-route tasks, which run alongside the current main task:
+///   `EngageTargets`, `EngageTargetsInZone`, `EngageGroup`, `EngageUnit`,
+///   `AWACS`, `Tanker`, `EWR`, `FACEngageGroup`, and `FAC`
+/// - main tasks: the other non-composite variants, including
+///   [`Task::Mission`] (fly/drive a route)
+/// - composite tasks: [`Task::ComboTask`] and [`Task::ControlledTask`]
+/// - [`Task::WrappedCommand`] and [`Task::WrappedOption`], which embed a
+///   [`Command`] or [`AiOption`] in a task (DCS `WrappedAction`), so they
+///   can be run from a route point
 #[derive(Debug, Clone)]
 pub enum Task<'lua> {
     AttackGroup {
@@ -522,6 +602,7 @@ pub enum Task<'lua> {
         altitude_type: Option<AltType>,
     },
     Hold,
+    // `FAC_AttackGroup` in DCS
     FACAttackGroup {
         group: GroupId,
         params: FACParams,
@@ -587,17 +668,24 @@ pub enum Task<'lua> {
         params: FACParams,
         priority: Option<i64>,
     },
+    /// Follow a route. Written to Lua as `params.route.points`.
     Mission {
         airborne: Option<bool>,
         route: Vec<MissionPoint<'lua>>,
     },
+    /// A list of tasks. When written to Lua each task gets a `number` field
+    /// holding its 1-based position in the list.
     ComboTask(Vec<Task<'lua>>),
+    /// `task`, run subject to start and stop conditions
     ControlledTask {
         task: Box<Task<'lua>>,
         condition: TaskStartCond<'lua>,
         stop_condition: TaskStopCond<'lua>,
     },
+    /// A command wrapped as a task (DCS `WrappedAction`)
     WrappedCommand(Command),
+    /// An option wrapped as a task (DCS `WrappedAction` with an `Option`
+    /// action)
     WrappedOption(AiOption<'lua>),
 }
 
@@ -605,6 +693,7 @@ impl<'lua> FromLua<'lua> for Task<'lua> {
     fn from_lua(value: Value<'lua>, lua: &'lua Lua) -> LuaResult<Self> {
         let root: LuaTable = FromLua::from_lua(value, lua)?;
         let id: String = root.raw_get("id")?;
+        // tasks without parameters may omit `params`; treat that as empty
         let params = match root.raw_get::<_, Option<LuaTable>>("params")? {
             Some(tbl) => tbl,
             None => lua.create_table()?,
@@ -764,6 +853,8 @@ impl<'lua> FromLua<'lua> for Task<'lua> {
                 condition: params.raw_get("condition")?,
                 stop_condition: params.raw_get("stopCondition")?,
             }),
+            // a wrapped action is either an option (id `Option`, with the
+            // option tag in `name`) or a command
             "WrappedAction" => {
                 let action: LuaTable = params.raw_get("action")?;
                 match action.raw_get::<_, String>("id")?.as_str() {
@@ -1081,6 +1172,7 @@ impl<'lua> IntoLua<'lua> for Task<'lua> {
             Self::ComboTask(tasks) => {
                 root.raw_set("id", "ComboTask")?;
                 let tbl = lua.create_table()?;
+                // number each subtask with its 1-based position
                 for (i, task) in tasks.into_iter().enumerate() {
                     tbl.push(task)?;
                     tbl.raw_get::<_, LuaTable>(i + 1)?
@@ -1093,6 +1185,8 @@ impl<'lua> IntoLua<'lua> for Task<'lua> {
                 condition,
                 stop_condition,
             } => {
+                // move the inner task out of the box; the placeholder is
+                // dropped unused
                 let task = mem::replace(task.as_mut(), Task::AWACS);
                 root.raw_set("id", "ControlledTask")?;
                 params.raw_set("task", task)?;
@@ -1120,6 +1214,7 @@ impl<'lua> IntoLua<'lua> for Task<'lua> {
     }
 }
 
+// The beacon type of `Command::ActivateBeacon` (the `type` parameter)
 simple_enum!(BeaconType, u16, [
     Null => 0,
     VOR => 1,
@@ -1139,6 +1234,7 @@ simple_enum!(BeaconType, u16, [
     NauticalHomer => 32776
 ]);
 
+// The beacon system of `Command::ActivateBeacon` (the `system` parameter)
 simple_enum!(BeaconSystem, u8, [
     PAR10 => 1,
     RSBN5 => 2,
@@ -1149,8 +1245,14 @@ simple_enum!(BeaconSystem, u8, [
     BroadcastStation => 7
 ]);
 
+/// An AI command, converted to and from the DCS command table
+/// `{ id = <name>, params = { ... } }`, set with [`Controller::set_command`]
+/// or embedded in a task with [`Task::WrappedCommand`]. Variants map onto
+/// the DCS command of the same name, except `Smoke` (`SMOKE_ON_OFF`) and
+/// `StopTransmission` (`stopTransmission`).
 #[derive(Debug, Clone)]
 pub enum Command {
+    /// Run a string of Lua code
     Script(String),
     SetCallsign {
         callname: i64,
@@ -1307,6 +1409,7 @@ impl<'lua> IntoLua<'lua> for Command {
                 name,
             } => {
                 root.raw_set("id", "ActivateICLS")?;
+                // ICLS always uses this fixed beacon type value
                 params.raw_set("type", 131584)?;
                 params.raw_set("channel", channel)?;
                 params.raw_set("unitId", unit)?;
@@ -1449,6 +1552,10 @@ impl<'lua> FromLua<'lua> for Command {
     }
 }
 
+// The value enums below are the numeric values DCS uses for the options in
+// `AirOption`, `GroundOption`, and `NavalOption`.
+
+// Air rules of engagement, `AirOption::Roe`
 simple_enum!(AirRoe, u8, [
     OpenFire => 2,
     OpenFireWeaponFree => 1,
@@ -1457,6 +1564,7 @@ simple_enum!(AirRoe, u8, [
     WeaponHold => 4
 ]);
 
+// `AirOption::ReactionOnThreat`
 simple_enum!(AirReactionToThreat, u8, [
     NoReaction => 0,
     PassiveDefence => 1,
@@ -1465,6 +1573,7 @@ simple_enum!(AirReactionToThreat, u8, [
     AllowAbortMission => 4
 ]);
 
+// `AirOption::EcmUsing`
 simple_enum!(AirEcmUsing, u8, [
     AlwaysUse => 3,
     NeverUse => 0,
@@ -1472,6 +1581,7 @@ simple_enum!(AirEcmUsing, u8, [
     UseIfOnlyLockByRadar => 1
 ]);
 
+// `AirOption::FlareUsing`
 simple_enum!(AirFlareUsing, u8, [
     AgainstFiredMissile => 1,
     Never => 0,
@@ -1479,6 +1589,8 @@ simple_enum!(AirFlareUsing, u8, [
     WhenFlyingNearEnemies => 3
 ]);
 
+// A formation, used by the `Formation` options and as the `action` of a
+// ground route point (`ActionTyp::Ground`)
 string_enum!(VehicleFormation, u8, [
     Cone => "Cone",
     Diamond => "Diamond",
@@ -1490,6 +1602,7 @@ string_enum!(VehicleFormation, u8, [
     Vee => "Vee"
 ]);
 
+// The range at which to launch missiles, `AirOption::MissileAttack`
 simple_enum!(AirMissileAttack, u8, [
     HalfwayRmaxNez => 2,
     MaxRange => 0,
@@ -1498,6 +1611,7 @@ simple_enum!(AirMissileAttack, u8, [
     TargetThreatEst => 3
 ]);
 
+// `AirOption::RadarUsing`
 simple_enum!(AirRadarUsing, u8, [
     ForAttackOnly => 1,
     ForContinuousSearch => 3,
@@ -1505,6 +1619,8 @@ simple_enum!(AirRadarUsing, u8, [
     Never => 0
 ]);
 
+/// An AI option for aircraft. Each variant has a numeric tag (the DCS
+/// `AI.Option.Air.id` value) and a value; see [`AiOption`].
 #[derive(Debug, Clone, Serialize)]
 pub enum AirOption<'lua> {
     EcmUsing(AirEcmUsing),
@@ -1559,6 +1675,7 @@ impl<'lua> IntoLua<'lua> for AirOption<'lua> {
 }
 
 impl<'lua> AirOption<'lua> {
+    // the DCS option id passed to `setOption`
     fn tag(&self) -> u8 {
         match self {
             Self::EcmUsing(_) => 13,
@@ -1585,7 +1702,11 @@ impl<'lua> AirOption<'lua> {
         }
     }
 
+    // build an option from its id and value, the inverse of `tag` and
+    // `into_lua`
     fn from_tag_val(lua: &'lua Lua, tag: u8, val: Value<'lua>) -> LuaResult<Self> {
+        // the radio usage options may hold a string starting with "none"
+        // instead of an attribute list; treat that as no attributes
         let attr_or_none = |val: Value<'lua>| match val {
             Value::String(s) if s.to_string_lossy().as_ref().starts_with("none") => {
                 Attributes::new(lua).map_err(|e| err(&format_compact!("{}", e)))
@@ -1619,18 +1740,23 @@ impl<'lua> AirOption<'lua> {
     }
 }
 
+// `GroundOption::AlarmState`
 simple_enum!(AlarmState, u8, [
     Auto => 0,
     Green => 1,
     Red => 2
 ]);
 
+// Ground and naval rules of engagement, `GroundOption::Roe` and
+// `NavalOption::Roe`
 simple_enum!(GroundRoe, u8, [
     OpenFire => 2,
     ReturnFire => 3,
     WeaponHold => 4
 ]);
 
+/// An AI option for ground units. Each variant has a numeric tag (the DCS
+/// `AI.Option.Ground.id` value) and a value; see [`AiOption`].
 #[derive(Debug, Clone, Serialize)]
 pub enum GroundOption {
     AcEngagementRangeRestriction(u8),
@@ -1657,6 +1783,7 @@ impl<'lua> IntoLua<'lua> for GroundOption {
 }
 
 impl GroundOption {
+    // the DCS option id passed to `setOption`
     fn tag(&self) -> u8 {
         match self {
             Self::AcEngagementRangeRestriction(_) => 24,
@@ -1685,6 +1812,8 @@ impl GroundOption {
     }
 }
 
+/// An AI option for ships. Each variant has a numeric tag (the DCS
+/// `AI.Option.Naval.id` value) and a value; see [`AiOption`].
 #[derive(Debug, Clone, Serialize)]
 pub enum NavalOption {
     Roe(GroundRoe),
@@ -1699,6 +1828,7 @@ impl<'lua> IntoLua<'lua> for NavalOption {
 }
 
 impl NavalOption {
+    // the DCS option id passed to `setOption`
     fn tag(&self) -> u8 {
         match self {
             Self::Roe(_) => 0,
@@ -1713,6 +1843,9 @@ impl NavalOption {
     }
 }
 
+/// An AI option for any kind of group, set with [`Controller::set_option`]
+/// or embedded in a task with [`Task::WrappedOption`]. Converting to Lua
+/// yields only the option's value; its id is supplied separately.
 #[derive(Debug, Clone, Serialize)]
 pub enum AiOption<'lua> {
     Air(AirOption<'lua>),
@@ -1739,6 +1872,9 @@ impl<'lua> AiOption<'lua> {
         }
     }
 
+    // the id alone doesn't say which domain an option belongs to (some ids
+    // are shared), so try air, then ground, then naval, and take the first
+    // that accepts both the id and the value
     fn from_tag_val(lua: &'lua Lua, tag: u8, val: Value<'lua>) -> LuaResult<Self> {
         match AirOption::from_tag_val(lua, tag, val.clone()) {
             Ok(v) => Ok(Self::Air(v)),
@@ -1755,6 +1891,8 @@ impl<'lua> AiOption<'lua> {
     }
 }
 
+// Detection methods (DCS `Controller.Detection`), combined as `BitFlags` to
+// filter detection queries
 bitflags_enum!(Detection, u8, [
     Dlink => 32,
     Irst => 8,
@@ -1764,6 +1902,9 @@ bitflags_enum!(Detection, u8, [
     Visual => 1
 ]);
 
+/// The result of [`Controller::is_target_detected`], built from the
+/// multiple values `isTargetDetected` returns, in order. Fails to convert
+/// if any value is missing.
 #[derive(Debug, Clone, Serialize)]
 pub struct DetectedTargetInfo {
     pub is_detected: bool,
@@ -1831,6 +1972,7 @@ impl<'lua> FromLuaMulti<'lua> for DetectedTargetInfo {
     }
 }
 
+/// An entry in the result of [`Controller::get_detected_targets`]
 #[derive(Debug, Clone, Serialize)]
 pub struct DetectedTarget<'lua> {
     pub object: Object<'lua>,
@@ -1851,6 +1993,8 @@ impl<'lua> FromLua<'lua> for DetectedTarget<'lua> {
     }
 }
 
+// The altitude reference for `Controller::set_altitude`. Written as `Radio`
+// or `Baro`; the upper case forms are also accepted when reading.
 string_enum!(AltitudeKind, u8, [
     Radio => "Radio",
     Baro => "Baro"
@@ -1859,41 +2003,55 @@ string_enum!(AltitudeKind, u8, [
     Baro => "BARO"
 ]);
 
+// A DCS AI controller, obtained from a group or unit (e.g.
+// `Group::get_controller`).
 wrapped_table!(Controller, Some("Controller"));
 
 impl<'lua> Controller<'lua> {
+    /// Replace the current main task with `task`. Calls `setTask`.
     pub fn set_task(&self, task: Task) -> Result<()> {
         Ok(self.t.call_method("setTask", task)?)
     }
 
+    /// Clear the current task. Calls `resetTask`.
     pub fn reset_task(&self) -> Result<()> {
         Ok(self.t.call_method("resetTask", ())?)
     }
 
+    /// Push `task` onto the task stack, suspending the current task until
+    /// it is popped. Calls `pushTask`.
     pub fn push_task(&self, task: Task) -> Result<()> {
         Ok(self.t.call_method("pushTask", task)?)
     }
 
+    /// Pop the top task off the task stack. Calls `popTask`.
     pub fn pop_task(&self) -> Result<()> {
         Ok(self.t.call_method("popTask", ())?)
     }
 
+    /// True if the controller has a task. Calls `hasTask`.
     pub fn has_task(&self) -> Result<bool> {
         Ok(self.t.call_method("hasTask", ())?)
     }
 
+    /// Execute `command` immediately. Calls `setCommand`.
     pub fn set_command(&self, command: Command) -> Result<()> {
         Ok(self.t.call_method("setCommand", command)?)
     }
 
+    /// Set an AI option. Calls `setOption` with the option's id and value.
     pub fn set_option(&self, option: AiOption<'lua>) -> Result<()> {
         Ok(self.t.call_method("setOption", (option.tag(), option))?)
     }
 
+    /// Turn the AI on or off. Calls `setOnOff`.
     pub fn set_on_off(&self, on: bool) -> Result<()> {
         Ok(self.t.call_method("setOnOff", on)?)
     }
 
+    /// Set the altitude to fly at, in meters. If `keep` is true the altitude
+    /// is held across waypoints. `kind` is passed only if given, otherwise
+    /// DCS uses its default reference. Calls `setAltitude`.
     pub fn set_altitude(
         &self,
         altitude: f32,
@@ -1906,14 +2064,21 @@ impl<'lua> Controller<'lua> {
         }?)
     }
 
+    /// Set the speed, in m/s. If `keep` is true the speed is held across
+    /// waypoints. Calls `setSpeed`.
     pub fn set_speed(&self, speed: f32, keep: bool) -> Result<()> {
         Ok(self.t.call_method("setSpeed", (speed, keep))?)
     }
 
+    /// Make the AI aware of `object`. `typ` and `distance` say whether its
+    /// type and distance are known. Calls `knowTarget`.
     pub fn know_target(&self, object: Object, typ: bool, distance: bool) -> Result<()> {
         Ok(self.t.call_method("knowTarget", (object, typ, distance))?)
     }
 
+    /// Whether, and how well, `object` is detected by any of the given
+    /// detection `methods`. Each method is passed as a separate argument to
+    /// `isTargetDetected`.
     pub fn is_target_detected(
         &self,
         object: Object,
@@ -1927,6 +2092,8 @@ impl<'lua> Controller<'lua> {
         Ok(self.t.call_method("isTargetDetected", args)?)
     }
 
+    /// Every target detected by any of the given detection `methods`. Each
+    /// method is passed as a separate argument to `getDetectedTargets`.
     pub fn get_detected_targets(
         &self,
         methods: BitFlags<Detection>,
