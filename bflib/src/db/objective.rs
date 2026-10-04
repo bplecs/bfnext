@@ -34,7 +34,7 @@ for more details.
 use super::{
     Db, Map, MapM, MapS, Set,
     group::{DeployKind, SpawnedUnit},
-    logistics::{Inventory, LogiStage, Warehouse},
+    logistics::{Inventory, Warehouse},
 };
 use crate::{
     group, group_health, group_mut,
@@ -756,19 +756,10 @@ impl Db {
         self.init_farp_warehouse(&oid)
             .context("initializing farp warehouse")?;
         self.setup_supply_lines().context("setup supply lines")?;
-        let trs = self
-            .deliver_supplies_from_logistics_hubs()
-            .context("distributing supplies")?;
-        // inject the transfers into the logistics state machine so the new
-        // farp is stocked without waiting for the next logistics tick
-        match &mut self.ephemeral.logistics_stage {
-            LogiStage::ExecuteTransfers { transfers } => transfers.extend(trs),
-            stage @ (LogiStage::Complete { .. }
-            | LogiStage::Init
-            | LogiStage::SyncFromWarehouses { .. }
-            | LogiStage::SyncToWarehouses { .. }) => {
-                *stage = LogiStage::ExecuteTransfers { transfers: trs };
-            }
+        // stock the new farp (its db warehouse was just initialized) without
+        // waiting for the next logistics tick
+        if let Err(e) = self.stock_objectives_now(lua, &[oid]) {
+            error!("failed to stock new farp {oid} {e:?}")
         }
         self.ephemeral
             .create_objective_markup(&self.persisted, objective!(self, oid)?);
@@ -1360,11 +1351,18 @@ impl Db {
                     .context("repairing captured airbase logi")?;
                 self.repair_services(*side, now, oid)
                     .context("repairing captured airbase services")?;
+                // pick up what is really in the warehouse before converting
+                // it, unless a logistics tick has db changes not yet in DCS
+                if !self.logistics_db_ahead() {
+                    if let Err(e) = self.sync_warehouse_to_objective(lua, oid) {
+                        error!("failed to sync captured {name} from warehouse {e:?}")
+                    }
+                }
                 self.capture_warehouse(lua, oid)
                     .context("capturing warehouse")?;
                 self.setup_supply_lines().context("setup supply lines")?;
-                self.deliver_supplies_from_logistics_hubs()
-                    .context("delivering supplies")?;
+                self.update_supply_status()
+                    .context("updating supply status")?;
                 let mut ucids: SmallVec<[Ucid; 1]> = smallvec![];
                 for (_, ucid, troop_origin, gid) in gids {
                     self.delete_group(&gid)
@@ -1393,16 +1391,14 @@ impl Db {
                 self.ephemeral.dirty();
             }
         }
-        // push the changed inventories out to every DCS warehouse
+        // stock the captured objectives from their new hubs and write the
+        // converted warehouses to DCS, without touching other objectives
         if actually_captured.len() > 0 {
-            self.ephemeral.logistics_stage = LogiStage::SyncToWarehouses {
-                objectives: self
-                    .persisted
-                    .objectives
-                    .into_iter()
-                    .map(|(oid, _)| *oid)
-                    .collect(),
-            };
+            let oids: SmallVec<[ObjectiveId; 4]> =
+                actually_captured.iter().map(|(_, oid)| *oid).collect();
+            if let Err(e) = self.stock_objectives_now(lua, &oids) {
+                error!("failed to stock captured objectives {oids:?} {e:?}")
+            }
         }
         for gid in to_mark {
             if let Err(e) = self

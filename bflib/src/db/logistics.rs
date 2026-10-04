@@ -567,6 +567,90 @@ impl Db {
         Ok(())
     }
 
+    /// True while a logistics tick has changed the db's inventories but not
+    /// yet written them all to DCS (or after loading, before the first
+    /// write). While this is true the db is authoritative and the tick will
+    /// write it to every DCS warehouse. Otherwise the DCS warehouses are
+    /// authoritative, since players may have used stock since the last sync.
+    pub(super) fn logistics_db_ahead(&self) -> bool {
+        match self.ephemeral.logistics_stage {
+            LogiStage::Init
+            | LogiStage::ExecuteTransfers { .. }
+            | LogiStage::SyncToWarehouses { .. } => true,
+            LogiStage::Complete { .. } | LogiStage::SyncFromWarehouses { .. } => false,
+        }
+    }
+
+    /// Stock objectives `oids` (just built or captured) from their logistics
+    /// hubs now, rather than waiting for the next logistics tick, and get
+    /// the result into DCS.
+    ///
+    /// The db inventories of `oids` must already be current (the caller
+    /// reads or initializes them). Only `oids` and the hubs that supply them
+    /// are read from or written to DCS, so stock used at other objectives
+    /// since the last tick isn't overwritten. If a tick has db changes not
+    /// yet in DCS (see [`Db::logistics_db_ahead`]) nothing is read, and the
+    /// tick writes the result out. Failures are logged; if a hub can't be
+    /// read, no supplies are moved but `oids` are still written.
+    pub(super) fn stock_objectives_now(&mut self, lua: MizLua, oids: &[ObjectiveId]) -> Result<()> {
+        if self.ephemeral.cfg.warehouse.is_none() {
+            return Ok(());
+        }
+        let ahead = self.logistics_db_ahead();
+        // the hubs supplying oids, excluding any in oids, whose db state the
+        // caller has already set
+        let mut hubs: SmallVec<[ObjectiveId; 4]> = smallvec![];
+        for oid in oids {
+            if let Some(hub) = objective!(self, oid)?.warehouse.supplier {
+                if !oids.contains(&hub) && !hubs.contains(&hub) {
+                    hubs.push(hub)
+                }
+            }
+        }
+        // read what the hubs really hold, so transfers come from current stock
+        let mut hubs_ok = true;
+        if !ahead {
+            for hub in &hubs {
+                if let Err(e) = self.sync_warehouse_to_objective(lua, *hub) {
+                    error!("failed to sync hub {hub} from warehouse {e:?}");
+                    hubs_ok = false;
+                }
+            }
+        }
+        if hubs_ok {
+            match self.deliver_supplies_to(Some(oids)) {
+                Err(e) => error!("failed to compute supplies for {oids:?} {e:?}"),
+                Ok(transfers) => {
+                    for tr in transfers {
+                        if let Err(e) = tr.execute(&mut self.persisted, &self.ephemeral.to_bg) {
+                            error!("executing transfer {:?} {e:?}", tr)
+                        }
+                    }
+                }
+            }
+        } else {
+            // a hub's db stock is stale, writing it would overwrite DCS
+            hubs.clear();
+        }
+        let to_write = oids.iter().chain(hubs.iter()).copied();
+        if ahead {
+            // Init and ExecuteTransfers write every objective once they
+            // reach SyncToWarehouses, but a sync already underway may have
+            // passed these objectives
+            if let LogiStage::SyncToWarehouses { objectives } = &mut self.ephemeral.logistics_stage {
+                objectives.extend(to_write);
+            }
+        } else {
+            for oid in to_write {
+                if let Err(e) = self.sync_objective_to_warehouse(lua, oid) {
+                    error!("failed to sync objective {oid} to warehouse {e:?}")
+                }
+            }
+        }
+        self.ephemeral.dirty();
+        Ok(())
+    }
+
     /// Make the next logistics tick start immediately (if idle)
     pub fn admin_tick_now(&mut self) {
         match &mut self.ephemeral.logistics_stage {
@@ -884,6 +968,12 @@ impl Db {
     /// in chunks of 1/8th of what remains, until the stock runs out or all
     /// demand (capacity - stored) is met.
     pub fn deliver_supplies_from_logistics_hubs(&mut self) -> Result<Vec<Transfer>> {
+        self.deliver_supplies_to(None)
+    }
+
+    /// Like [`Db::deliver_supplies_from_logistics_hubs`], but if `only` is
+    /// given, only compute transfers to those objectives.
+    fn deliver_supplies_to(&mut self, only: Option<&[ObjectiveId]>) -> Result<Vec<Transfer>> {
         self.update_supply_status()
             .context("updating supply status")?;
         let mut transfers: Vec<Transfer> = vec![];
@@ -893,6 +983,7 @@ impl Db {
                 .warehouse
                 .destination
                 .into_iter()
+                .filter(|oid| only.map_or(true, |only| only.contains(oid)))
                 .filter_map(|oid| Some((oid, self.persisted.objectives.get(oid)?)))
                 .filter(|(_, obj)| logi.owner == obj.owner && (obj.supply < 100 || obj.fuel < 100))
                 .map(|(oid, obj)| Needed {
@@ -1056,7 +1147,7 @@ impl Db {
     /// Recompute every objective's `supply` and `fuel` percentages as the
     /// average fill percent of its equipment and liquids (items with zero
     /// capacity are ignored), publishing a stat when they change.
-    fn update_supply_status(&mut self) -> Result<()> {
+    pub(super) fn update_supply_status(&mut self) -> Result<()> {
         for (_, obj) in self.persisted.objectives.iter_mut_cow() {
             let current_supply = obj.supply;
             let current_fuel = obj.fuel;
