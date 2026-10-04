@@ -45,7 +45,7 @@ use bfprotocols::{
     stats::Stat,
 };
 use chrono::prelude::*;
-use compact_str::format_compact;
+use compact_str::{format_compact, CompactString};
 use dcso3::{
     MizLua, String, Vector2,
     coalition::Side,
@@ -385,6 +385,11 @@ impl FromStr for AdminCommand {
 /// `<troop|deployable> <side> <heading> <name>`. Spawned units are
 /// owned by the admin who ran the command, or by nobody (the default
 /// ucid) if it came from an external client.
+///
+/// Each mark is handled independently. Marks that spawn successfully are
+/// removed, marks that fail are left in place so they can be fixed and the
+/// command rerun without respawning the others. If any mark fails, an
+/// error listing every failure is returned after all marks are processed.
 fn admin_spawn(ctx: &mut Context, lua: MizLua, id: Option<PlayerId>, key: String) -> Result<()> {
     let mut to_remove: SmallVec<[MarkId; 8]> = smallvec![];
     let act = Trigger::singleton(lua)?.action()?;
@@ -415,128 +420,140 @@ fn admin_spawn(ctx: &mut Context, lua: MizLua, id: Option<PlayerId>, key: String
             }
         }
     }
+    // spawn the thing described by one mark's text (with the key stripped)
+    let mut spawn_mark = |spec: &str, pos: Vector2| -> Result<()> {
+        // splitn so the name (the last field) may contain spaces
+        let mut iter = spec.splitn(4, " ");
+        let kind = iter
+            .next()
+            .ok_or_else(|| {
+                anyhow!(
+                    "spawn mark '{}' missing kind expected troop or deployable",
+                    spec
+                )
+            })?
+            .parse::<Kind>()?;
+        let side = iter
+            .next()
+            .ok_or_else(|| anyhow!("spawn mark {} missing side", spec))?;
+        let side = side.parse::<Side>().with_context(|| {
+            format_compact!("error parsing {} as a side in mark {}", side, spec)
+        })?;
+        let heading = iter
+            .next()
+            .ok_or_else(|| anyhow!("spawn mark {} missing heading", spec))?;
+        let heading = degrees_to_radians(heading.parse::<u32>().with_context(|| {
+            format_compact!("error parsing {} as a heading in mark {}", heading, spec)
+        })? as f64);
+        let name = iter
+            .next()
+            .ok_or_else(|| anyhow!("spawn mark {} missing name of the thing to spawn", spec))?;
+        let loc = SpawnLoc::AtPos {
+            pos,
+            offset_direction: pointing_towards2(heading),
+            group_heading: heading,
+        };
+        match kind {
+            Kind::Troop => {
+                let specs = ctx
+                    .db
+                    .ephemeral
+                    .cfg
+                    .troops
+                    .get(&side)
+                    .ok_or_else(|| anyhow!("no troops on {side}"))?;
+                let spec = specs
+                    .iter()
+                    .find(|tr| tr.name.as_str() == name)
+                    .ok_or_else(|| anyhow!("no troop called {name} on {side}"))?
+                    .clone();
+                let origin = DeployKind::Troop {
+                    player: ucid,
+                    moved_by: None,
+                    spec: spec.clone(),
+                    origin: None,
+                    cost_fraction: 1.,
+                };
+                ctx.db
+                    .add_and_queue_group(
+                        &spctx,
+                        &ctx.idx,
+                        side,
+                        loc,
+                        &spec.template,
+                        origin,
+                        BitFlags::empty(),
+                        None,
+                    )
+                    .context("adding group")?;
+            }
+            Kind::Deployable => {
+                let specs = ctx
+                    .db
+                    .ephemeral
+                    .cfg
+                    .deployables
+                    .get(&side)
+                    .ok_or_else(|| anyhow!("no deployables on {side}"))?;
+                // deployables are named by the last element of their menu path
+                let spec = specs
+                    .iter()
+                    .find(|dp| dp.path.ends_with(&[String::from(name)]))
+                    .ok_or_else(|| anyhow!("no deployable called {name} on {side}"))?
+                    .clone();
+                match &spec.kind {
+                    DeployableKind::Objective(parts) => {
+                        ctx.db
+                            .add_farp(lua, &spctx, &ctx.idx, side, pos, &spec, parts)
+                            .context("adding farp")?;
+                    }
+                    DeployableKind::Group { template } => {
+                        let origin = DeployKind::Deployed {
+                            player: ucid,
+                            moved_by: None,
+                            spec: spec.clone(),
+                            origin: None,
+                            cost_fraction: 1.,
+                        };
+                        ctx.db
+                            .add_and_queue_group(
+                                &spctx,
+                                &ctx.idx,
+                                side,
+                                loc,
+                                &template,
+                                origin,
+                                BitFlags::empty(),
+                                None,
+                            )
+                            .context("adding group")?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    let mut errors: SmallVec<[CompactString; 4]> = smallvec![];
     for mk in World::singleton(lua)?
         .get_mark_panels()
         .context("getting marks")?
     {
         let mk = mk?;
-        if mk.text.starts_with(key.as_str()) {
-            to_remove.push(mk.id);
-            let spec = mk.text.as_str().strip_prefix(key.as_str()).unwrap();
-            // splitn so the name (the last field) may contain spaces
-            let mut iter = spec.splitn(4, " ");
-            let kind = iter
-                .next()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "spawn mark '{}' missing kind expected troop or deployable",
-                        spec
-                    )
-                })?
-                .parse::<Kind>()?;
-            let side = iter
-                .next()
-                .ok_or_else(|| anyhow!("spawn mark {} missing side", spec))?;
-            let side = side.parse::<Side>().with_context(|| {
-                format_compact!("error parsing {} as a side in mark {}", side, spec)
-            })?;
-            let heading = iter
-                .next()
-                .ok_or_else(|| anyhow!("spawn mark {} missing heading", spec))?;
-            let heading = degrees_to_radians(heading.parse::<u32>().with_context(|| {
-                format_compact!("error parsing {} as a heading in mark {}", heading, spec)
-            })? as f64);
-            let name = iter
-                .next()
-                .ok_or_else(|| anyhow!("spawn mark {} missing name of the thing to spawn", spec))?;
+        if let Some(spec) = mk.text.as_str().strip_prefix(key.as_str()) {
             let pos = Vector2::new(mk.pos.x, mk.pos.z);
-            let loc = SpawnLoc::AtPos {
-                pos,
-                offset_direction: pointing_towards2(heading),
-                group_heading: heading,
-            };
-            match kind {
-                Kind::Troop => {
-                    let specs = ctx
-                        .db
-                        .ephemeral
-                        .cfg
-                        .troops
-                        .get(&side)
-                        .ok_or_else(|| anyhow!("no troops on {side}"))?;
-                    let spec = specs
-                        .iter()
-                        .find(|tr| tr.name.as_str() == name)
-                        .ok_or_else(|| anyhow!("no troop called {name} on {side}"))?
-                        .clone();
-                    let origin = DeployKind::Troop {
-                        player: ucid,
-                        moved_by: None,
-                        spec: spec.clone(),
-                        origin: None,
-                        cost_fraction: 1.,
-                    };
-                    ctx.db
-                        .add_and_queue_group(
-                            &spctx,
-                            &ctx.idx,
-                            side,
-                            loc,
-                            &spec.template,
-                            origin,
-                            BitFlags::empty(),
-                            None,
-                        )
-                        .context("adding group")?;
-                }
-                Kind::Deployable => {
-                    let specs = ctx
-                        .db
-                        .ephemeral
-                        .cfg
-                        .deployables
-                        .get(&side)
-                        .ok_or_else(|| anyhow!("no deployables on {side}"))?;
-                    // deployables are named by the last element of their menu path
-                    let spec = specs
-                        .iter()
-                        .find(|dp| dp.path.ends_with(&[String::from(name)]))
-                        .ok_or_else(|| anyhow!("no deployable called {name} on {side}"))?
-                        .clone();
-                    match &spec.kind {
-                        DeployableKind::Objective(parts) => {
-                            ctx.db
-                                .add_farp(lua, &spctx, &ctx.idx, side, pos, &spec, parts)
-                                .context("adding farp")?;
-                        }
-                        DeployableKind::Group { template } => {
-                            let origin = DeployKind::Deployed {
-                                player: ucid,
-                                moved_by: None,
-                                spec: spec.clone(),
-                                origin: None,
-                                cost_fraction: 1.,
-                            };
-                            ctx.db
-                                .add_and_queue_group(
-                                    &spctx,
-                                    &ctx.idx,
-                                    side,
-                                    loc,
-                                    &template,
-                                    origin,
-                                    BitFlags::empty(),
-                                    None,
-                                )
-                                .context("adding group")?;
-                        }
-                    }
-                }
+            match spawn_mark(spec, pos) {
+                Ok(()) => to_remove.push(mk.id),
+                Err(e) => errors.push(format_compact!("mark '{}': {e:?}", mk.text)),
             }
         }
     }
     for id in to_remove {
-        act.remove_mark(id).context("removing mark")?;
+        if let Err(e) = act.remove_mark(id) {
+            errors.push(format_compact!("removing mark {id:?}: {e:?}"))
+        }
+    }
+    if !errors.is_empty() {
+        bail!("{}", errors.join("; "))
     }
     Ok(())
 }
