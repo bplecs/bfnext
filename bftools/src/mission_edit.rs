@@ -1,3 +1,27 @@
+//! The `miz` tool: build a campaign mission from a base mission and templates.
+//!
+//! A .miz file is a zip archive containing Lua files (`mission`, `options`,
+//! `warehouses`, ...) that each assign a global table. [`run`] unpacks the
+//! base mission, loads those tables into a Lua state, edits them, serializes
+//! them back to Lua source, and repacks the archive. The edits are:
+//!
+//! - Slot generation. Trigger zones named `TS...` in the base mission are
+//!   filled with client slots, laid out on a grid (quad zones) or in rings
+//!   (circular zones). The zone's properties say how many of each airframe
+//!   each side gets; `TTS...` zones define reusable property sets that `TS`
+//!   zones can `include`.
+//! - Slot templates. Every client slot gets the payload, radio, frequency
+//!   and `AddPropAircraft` settings of the matching airframe in the weapon
+//!   template mission, and is renamed `<objective> <type> <n>` after the
+//!   objective zone (`O...`) it sits in.
+//! - Warehouses (optional). Every warehouse is reset to the template's
+//!   `DEFAULT` inventory, except the two production warehouses, which get
+//!   the template's blue and red production inventories.
+//! - Options. The options file is replaced with the one from the options
+//!   template mission.
+//!
+//! Original design notes:
+//!
 //shell script -> pass in config (gets theatre/era from base miz) -> create both missions(clones) -> set server config
 //start server
 
@@ -40,8 +64,14 @@ use std::{
 };
 use zip::{read::ZipArchive, write::FileOptions, ZipWriter};
 
+/// The single Lua state, leaked in [`run`] so values borrowed from it can be
+/// `'static`. Set once before anything reads it.
 static mut LUA: *const Lua = ptr::null();
 
+/// Copy a Lua value, recursively copying tables (and their keys and values)
+/// rather than sharing them. Lua table assignment shares the table, so this
+/// is needed whenever a template is placed into the mission more than once.
+/// Metatables, functions, threads, and userdata are still shared.
 pub trait DeepClone<'lua>: IntoLua<'lua> + FromLua<'lua> + Clone {
     fn deep_clone(&self, lua: &'lua Lua) -> Result<Self>;
 }
@@ -76,13 +106,20 @@ where
     }
 }
 
+/// An objective trigger zone from the base mission, used to name the client
+/// slots inside it.
 struct TriggerZone {
     inner: miz::TriggerZone<'static>,
+    /// the zone name without its 4 character prefix (e.g. `OABB`)
     objective_name: String,
+    /// slots named so far in this zone, by airframe type
     spawn_count: HashMap<String, isize>,
 }
 
 impl TriggerZone {
+    /// Wrap `zone` if it is an objective zone (its name starts with `O`),
+    /// otherwise return None. Errors if an objective zone's name is too
+    /// short to hold the prefix and a name.
     pub fn new(zone: &Table<'static>) -> Result<Option<Self>> {
         let zone = zone.clone();
         let inner = miz::TriggerZone::from_lua(Value::Table(zone), unsafe { &*LUA })?;
@@ -103,6 +140,7 @@ impl TriggerZone {
         }
     }
 
+    /// Whether point `v` is inside the zone
     pub fn contains(&self, v: Vector2) -> Result<bool> {
         let pos = self.inner.pos()?;
         match self.inner.typ()? {
@@ -112,8 +150,11 @@ impl TriggerZone {
     }
 }
 
+/// A .miz archive extracted to a directory next to it (the archive's path
+/// without its extension). The directory is deleted when this is dropped.
 struct UnpackedMiz {
     root: PathBuf,
+    /// archive entry name (e.g. `mission`) to its extracted path
     files: HashMap<String, PathBuf>,
 }
 
@@ -124,6 +165,7 @@ impl Drop for UnpackedMiz {
 }
 
 impl UnpackedMiz {
+    /// Extract every entry of the archive at `path`
     fn new(path: &Path) -> Result<Self> {
         let mut files: HashMap<String, PathBuf> = HashMap::new();
         let mut archive = ZipArchive::new(File::open(path).context("opening miz file")?)
@@ -148,6 +190,8 @@ impl UnpackedMiz {
         Ok(Self { root, files })
     }
 
+    /// Zip the extracted files (including any edits) into `destination_file`,
+    /// keeping their original entry names
     fn pack(&self, destination_file: &Path) -> Result<()> {
         info!("repacking current miz to: {destination_file:?}");
         let file = File::create(&destination_file)
@@ -174,8 +218,13 @@ impl UnpackedMiz {
     }
 }
 
+/// Formats a Lua value as Lua source, in the layout the mission editor uses
+/// (`[key] = value,` per line, tables indented 4 spaces per level).
+/// Functions, threads, userdata, and errors can't be serialized and panic,
+/// which [`serialize_to_lua`] turns into an error.
 struct LuaSerVal {
     value: Value<'static>,
+    /// indent in spaces
     level: usize,
 }
 
@@ -215,6 +264,8 @@ impl Display for LuaSerVal {
                         }
                     };
                 }
+                // write the sequence part (keys 1..n) first and in order,
+                // then every other key, skipping the ones already written
                 let mut seq_max: Option<i64> = None;
                 write!(f, "\n")?;
                 self.indented(f)?;
@@ -249,6 +300,9 @@ impl Display for LuaSerVal {
     }
 }
 
+/// Serialize `value` as the Lua statement `<key> = <value>`, the format of
+/// the files inside a .miz. [`LuaSerVal`] panics on errors (`Display` can't
+/// return them), so the panic is caught and converted to an error.
 fn serialize_to_lua(key: &str, value: Value<'static>) -> Result<std::string::String> {
     let res = std::panic::catch_unwind(AssertUnwindSafe(move || {
         use std::fmt::Write;
@@ -276,6 +330,8 @@ fn serialize_to_lua(key: &str, value: Value<'static>) -> Result<std::string::Str
     }
 }
 
+/// An unpacked .miz with its `mission`, `options`, and `warehouses` tables
+/// loaded into Lua
 struct LoadedMiz {
     miz: UnpackedMiz,
     mission: Miz<'static>,
@@ -286,6 +342,9 @@ struct LoadedMiz {
 }
 
 impl LoadedMiz {
+    /// Unpack the .miz at `path` and run its `mission`, `options`, and
+    /// `warehouses` files, which define globals of the same names. Errors if
+    /// any of the three is missing or empty.
     fn new(lua: &'static Lua, path: &Path) -> Result<Self> {
         let miz = UnpackedMiz::new(path).with_context(|| format_compact!("unpacking {path:?}"))?;
         let mut mission = lua.create_table()?;
@@ -338,6 +397,8 @@ impl LoadedMiz {
     }
 }
 
+/// Iterate over a country's groups of category `name` (`plane`,
+/// `helicopter`, `static`, ...). Empty if the country has none.
 fn vehicle(
     country: &Table<'static>,
     name: &str,
@@ -355,19 +416,36 @@ fn vehicle(
     }
 }
 
+/// Increment the counter for `key`, starting from 0, and return the new value
 fn increment_key(map: &mut HashMap<String, isize>, key: &str) -> isize {
     let n = map.entry(String::from(key)).or_default();
     *n += 1;
     *n
 }
 
+/// The slots to generate in a `TS` zone (or a reusable `TTS` template),
+/// parsed from the zone's properties
 struct SlotSpec {
+    /// side -> airframe type -> number of slots
     slots: HashMap<Side, HashMap<String, usize>>,
+    /// distance in meters to keep from the zone edge
     margin: Option<f64>,
+    /// distance in meters between slots
     spacing: Option<f64>,
 }
 
 impl SlotSpec {
+    /// Parse zone properties, in order:
+    ///
+    /// - `include` = `<template>`: add the slots of `TTS` template
+    ///   `<template>` from `templates`, and take its margin and spacing
+    /// - `margin` / `spacing` = `<meters>`
+    /// - `Blue` / `Red` (any case `Side` parses): following airframe
+    ///   properties are for this side
+    /// - `<airframe type>` = `<count>`: add `count` slots of that type
+    ///
+    /// Errors on an unknown template, an airframe before any side, or a
+    /// value that doesn't parse.
     fn new(templates: &HashMap<String, SlotSpec>, props: Sequence<Property>) -> Result<Self> {
         let mut slots: HashMap<Side, HashMap<String, usize>> = HashMap::default();
         let mut side = None;
@@ -418,22 +496,33 @@ impl SlotSpec {
     }
 }
 
+/// Generates positions for slots within a zone
 trait PosGenerator {
+    /// The next free position, or an error if the zone is full
     fn next(&mut self) -> Result<Vector2>;
+    /// The heading, in radians, the slot at the last position should face
     fn azumith(&self) -> f64;
 }
 
+/// Slot positions in a circular zone: concentric rings, from the outside
+/// in, with slots facing the center
 #[derive(Debug)]
 struct SlotRadial {
     center: Vector2,
+    /// (ring radius, azimuths of the slots on that ring)
     slots: Vec<(f64, Vec<f64>)>,
+    /// the current ring
     i: usize,
+    /// the next slot on the current ring
     j: usize,
     last_az: f64,
     name: String,
 }
 
 impl SlotRadial {
+    /// Precompute every slot position. The outer ring is `margin` inside the
+    /// zone edge, rings are `spacing` apart, and slots on a ring are about
+    /// `spacing` apart. Margin and spacing default to 5 and 25 meters.
     fn new(
         name: String,
         radius: f64,
@@ -444,6 +533,8 @@ impl SlotRadial {
         let margin = margin.unwrap_or(5.);
         let spacing = spacing.unwrap_or(25.);
         let mut radius = radius - margin;
+        // the angle between slots, so neighbors on the ring are roughly
+        // `spacing` apart
         let mut step = (spacing / radius).asin();
         let mut slots: Vec<(f64, Vec<f64>)> = vec![(radius, vec![])];
         let mut i = 0;
@@ -456,6 +547,8 @@ impl SlotRadial {
                 match slots[i].1.last().map(|az| *az) {
                     None => slots[i].1.push(0.),
                     Some(az) => {
+                        // the ring is full once going around further would
+                        // wrap past 0 and crowd the first slot
                         let next2 = change_heading(az, step * 2.);
                         if next2 < az {
                             i += 1;
@@ -494,6 +587,7 @@ impl PosGenerator for SlotRadial {
                 },
             }
         };
+        // face back toward the center
         self.last_az = change_heading(az, PI);
         Ok(self.center + pointing_towards2(az) * radius)
     }
@@ -503,20 +597,31 @@ impl PosGenerator for SlotRadial {
     }
 }
 
+/// Slot positions in a quad zone: a grid aligned with the quad's longest
+/// edge, filled one column at a time, with slots facing along the rows
 struct SlotGrid {
     name: String,
     quad: Quad2,
+    /// the start of the current column
     cr: Vector2,
+    /// the heading slots face, along the row axis
     row_az: f64,
+    /// unit vector from one column to the next
     row: Vector2,
+    /// unit vector along a column
     column: Vector2,
+    /// the next position to hand out
     current: Vector2,
     margin: f64,
     spacing: f64,
+    /// length of the longest edge, bounds the search for a column start
     max_edge: f64,
 }
 
 impl SlotGrid {
+    /// Lay the grid out from one end of the quad's longest edge, `margin`
+    /// in from both sides. Margin and spacing default to 5 and 25 meters.
+    /// Errors if no orientation of the axes points into the quad.
     fn new(name: String, quad: Quad2, margin: Option<f64>, spacing: Option<f64>) -> Result<Self> {
         let margin = margin.unwrap_or(5.);
         let spacing = spacing.unwrap_or(25.);
@@ -563,9 +668,12 @@ impl PosGenerator for SlotGrid {
         let res = self.current;
         let p = self.current + self.column * self.spacing;
         if self.quad.contains(LuaVec2(p + self.column * self.margin)) {
+            // room for another slot in this column
             self.current = p;
             Ok(res)
         } else {
+            // start the next column, sliding along the column axis until
+            // the start is inside the quad (the quad may not be a rectangle)
             let mut cr = self.cr + self.row * self.spacing;
             let mut moved = 0.;
             while !self.quad.contains(LuaVec2(cr - self.column * self.margin)) {
@@ -592,16 +700,23 @@ enum SlotType {
     Helicopter,
 }
 
+/// Per side, per airframe type settings taken from the weapon template
+/// mission. Each map is keyed by side, then by unit type name.
 struct VehicleTemplates {
+    /// the group to copy when generating a plane slot
     plane_slots: HashMap<Side, HashMap<String, Group<'static>>>,
+    /// the group to copy when generating a helicopter slot
     helicopter_slots: HashMap<Side, HashMap<String, Group<'static>>>,
     payload: HashMap<Side, HashMap<String, Table<'static>>>,
+    /// the unit's `AddPropAircraft` table (aircraft specific settings)
     prop_aircraft: HashMap<Side, HashMap<String, Table<'static>>>,
     radio: HashMap<Side, HashMap<String, Table<'static>>>,
     frequency: HashMap<Side, HashMap<String, Value<'static>>>,
 }
 
 impl VehicleTemplates {
+    /// Collect the templates from every blue and red plane and helicopter in
+    /// `wep`. If an airframe appears more than once, the last one wins.
     fn new(wep: &LoadedMiz) -> Result<Self> {
         let mut plane_slots: HashMap<Side, HashMap<String, Group>> = HashMap::new();
         let mut helicopter_slots: HashMap<Side, HashMap<String, Group>> = HashMap::new();
@@ -675,7 +790,19 @@ impl VehicleTemplates {
         })
     }
 
+    /// Fill every `TS` zone in `base` with the client slots its properties
+    /// ask for (see [`SlotSpec`]).
+    ///
+    /// Each slot is a deep copy of the airframe's template group with a new
+    /// group and unit id, its ground start waypoint and units moved to the
+    /// next position from the zone's [`PosGenerator`], and its datalink
+    /// ownship entries updated. Slots go in the side's CJTF country, which is
+    /// created if missing. Errors if a template is missing, isn't a ground
+    /// start, isn't Client skill, or the zone fills up.
     fn generate_slots(&self, lua: &Lua, base: &mut LoadedMiz) -> Result<()> {
+        /// Point the unit's own entry in each datalink network (Link16,
+        /// IDM, SADL) at its new unit id. Errors if the unit has datalinks
+        /// but none of the known layouts match.
         fn set_dl_mizuid(unit: &Table) -> Result<()> {
             if let Ok(Some(dl)) = unit.raw_get::<_, Option<Table>>("datalinks") {
                 let uid = unit.raw_get::<_, i64>("unitId")?;
@@ -709,12 +836,14 @@ impl VehicleTemplates {
             }
             Ok(())
         }
+        // new ids start after the highest ids already in the mission
         let idx = base.mission.index()?;
         let mut templates = HashMap::default();
         let mut uid = idx.max_uid();
         let mut gid = idx.max_gid();
         uid.next();
         gid.next();
+        // first pass collects the TTS templates so TS zones can include them
         for zone in base.mission.triggers()? {
             let zone = zone?;
             if let Some(s) = zone.name()?.strip_prefix("TTS") {
@@ -771,6 +900,7 @@ impl VehicleTemplates {
                         coa.country(cname)?.unwrap()
                     }
                 };
+                // make sure the country has plane and helicopter group lists
                 let helicopters = {
                     let heli = country.helicopters()?;
                     if heli.len() > 0 {
@@ -807,6 +937,7 @@ impl VehicleTemplates {
                     for _ in 0..*n {
                         let tmpl = tmpl.deep_clone(lua)?;
                         let pos = posgen.next()?;
+                        // move the takeoff waypoint to the slot position
                         let route = tmpl.route()?;
                         let mut has_ground_start = false;
                         route.set_points(
@@ -852,12 +983,22 @@ impl VehicleTemplates {
         Ok(())
     }
 
+    /// Apply the templates to every client slot in `base`, generated or
+    /// hand placed. AI aircraft are left alone.
+    ///
+    /// Each slot gets a copy of its airframe's payload, `AddPropAircraft`,
+    /// radio, and frequency settings. Aircraft with a Link16 STN get the next
+    /// unique one (octal, starting at 00001). The unit and group are renamed
+    /// `<objective> <type> <n>`, plus ` STN#<stn>` if it has one, after the
+    /// objective zone the slot is in. Logs the slot counts per objective.
+    /// Errors if a slot isn't inside any objective zone.
     fn apply(
         &self,
         lua: &Lua,
         objectives: &mut Vec<TriggerZone>,
         base: &mut LoadedMiz,
     ) -> Result<()> {
+        // objective name -> airframe type -> number of slots, for the log
         let mut slots: HashMap<String, HashMap<String, usize>> = HashMap::default();
         let mut replace_count: HashMap<String, isize> = HashMap::new();
         let mut stn = 1u64;
@@ -980,13 +1121,20 @@ impl VehicleTemplates {
     }
 }
 
+/// Warehouse inventories taken from the warehouse template mission
 struct WarehouseTemplate {
+    /// blue's production, see `MizCmd::blue_production_template`
     blue_inventory: Table<'static>,
+    /// red's production, see `MizCmd::red_production_template`
     red_inventory: Table<'static>,
+    /// the inventory every other warehouse starts with
     default: Table<'static>,
 }
 
 impl WarehouseTemplate {
+    /// Find the inventories of the template's invisible FARPs: one named
+    /// `DEFAULT` and one for each side's production template name. Errors if
+    /// any is missing or there is an invisible FARP with any other name.
     fn new(wht: &LoadedMiz, cfg: &MizCmd) -> Result<Self> {
         let mut blue_inventory_id = 0;
         let mut red_inventory_id = 0;
@@ -1051,7 +1199,11 @@ impl WarehouseTemplate {
         })
     }
 
+    /// Reset every airport and FARP/helipad warehouse in `base` to the
+    /// default inventory, and set the warehouses of the FARPs named after
+    /// the production templates to the production inventories.
     fn apply(&self, lua: &Lua, cfg: &MizCmd, base: &mut LoadedMiz) -> Result<()> {
+        // static warehouses are keyed by the unit id of their FARP
         let mut blue_inventory = 0;
         let mut red_inventory = 0;
         let mut whids = vec![];
@@ -1124,6 +1276,7 @@ impl WarehouseTemplate {
     }
 }
 
+/// The objective trigger zones (names starting with `O`) in `base`
 fn compile_objectives(base: &LoadedMiz) -> Result<Vec<TriggerZone>> {
     let mut objectives = Vec::new();
     for zone in base
@@ -1142,7 +1295,11 @@ fn compile_objectives(base: &LoadedMiz) -> Result<Vec<TriggerZone>> {
     Ok(objectives)
 }
 
+/// Run the `miz` tool: build `cfg.output` from `cfg.base` and the template
+/// missions (see the module docs for the steps)
 pub fn run(cfg: &MizCmd) -> Result<()> {
+    // leak the Lua state so values from it can be 'static, and stop the gc
+    // since this is a short lived tool
     let lua = Box::leak(Box::new(Lua::new()));
     lua.gc_stop();
     let lua = unsafe {
@@ -1179,6 +1336,7 @@ pub fn run(cfg: &MizCmd) -> Result<()> {
         info!("wrote serialized warehouses to warehouse file.");
     }
     //replace options file
+    // (moved from the template's extraction dir, which is deleted on drop)
     let options_template = UnpackedMiz::new(&cfg.options).context("loading options template")?;
     let source_options_path = options_template.files.get("options").unwrap();
     let destination_options_path = base.miz.files.get("options").unwrap();
