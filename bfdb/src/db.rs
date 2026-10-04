@@ -158,20 +158,17 @@ impl Pilots {
         Ok(())
     }
 
+    /// Update the aggregates for `k`, creating them on first use
     fn with_aggregates<F: FnMut(&mut Aggregates)>(
         &self,
         k: (Ucid, Vehicle, RoundId),
         mut f: F,
     ) -> Result<()> {
-        self.aggregates
-            .fetch_and_update(&k, |a| match a {
-                None => None,
-                Some(mut a) => {
-                    f(&mut a);
-                    Some(a)
-                }
-            })?
-            .ok_or_else(|| anyhow!("aggregates {k:?} is missing"))?;
+        self.aggregates.fetch_and_update(&k, |a| {
+            let mut a = a.unwrap_or_default();
+            f(&mut a);
+            Some(a)
+        })?;
         Ok(())
     }
 
@@ -641,6 +638,7 @@ impl StatsDb {
                 tags.contains(UnitTag::Aircraft) || tags.contains(UnitTag::Helicopter)
             }
         };
+        // if any shot hit, only shots that hit get credit
         let no_hit = dead.shots.iter().any(|s| s.hit);
         let up = |a: &mut Aggregates| {
             if air {
@@ -649,6 +647,8 @@ impl StatsDb {
                 a.ground_kills += 1
             }
         };
+        // a shooter may have several shots on the victim, but gets one kill
+        let mut credited: SmallVec<[Ucid; 4]> = smallvec![];
         for shot in dead.shots.iter() {
             if no_hit && !shot.hit {
                 continue;
@@ -661,12 +661,15 @@ impl StatsDb {
                 | Who::AI {
                     ucid: Some(ucid), ..
                 } => {
-                    self.pilots.with_pilot_and_aggregates(
-                        *ucid,
-                        ctx.round,
-                        |p| up(&mut p.total),
-                        |a| up(a),
-                    )?;
+                    if !credited.contains(ucid) {
+                        credited.push(*ucid);
+                        self.pilots.with_pilot_and_aggregates(
+                            *ucid,
+                            ctx.round,
+                            |p| up(&mut p.total),
+                            |a| up(a),
+                        )?;
+                    }
                     EnId::Player(*ucid)
                 }
             };
@@ -740,12 +743,18 @@ impl StatsDb {
                 perf,
                 frame,
             } => {
-                match self
-                    .session
-                    .scan_prefix(&ctx.round)?
-                    .next_back()
-                    .transpose()?
-                {
+                // find the latest session in the round by comparing start
+                // times. The keys don't sort by time: DateTime serializes as
+                // a variable length string, and length prefixed strings sort
+                // by length first, so next_back() isn't always the latest.
+                let mut latest: Option<((RoundId, DateTime<Utc>), Session)> = None;
+                for r in self.session.scan_prefix(&ctx.round)? {
+                    let (k, s) = r?;
+                    if latest.as_ref().map_or(true, |((_, t), _)| k.1 > *t) {
+                        latest = Some((k, s));
+                    }
+                }
+                match latest {
                     None => bail!("no session for {} is in progress", &ctx.sortie),
                     Some((k, mut session)) => {
                         session.end = Some(SessionEnd {
@@ -799,7 +808,7 @@ impl StatsDb {
             Stat::ObjectiveSupply { id, supply, fuel } => {
                 self.with_objective((ctx.round, id), |o| {
                     o.supply = supply;
-                    o.logi = fuel
+                    o.fuel = fuel
                 })?;
             }
             Stat::Capture { id, by, side } => {
@@ -875,8 +884,8 @@ impl StatsDb {
                 self.pilots.with_pilot_and_aggregates(
                     by,
                     ctx.round,
-                    |p| p.total.troops += 1,
-                    |a| a.troops += 1,
+                    |p| p.total.deploys += 1,
+                    |a| a.deploys += 1,
                 )?;
                 self.with_group((ctx.round, gid), |group| {
                     group.kind = GroupKind::Deployed {
