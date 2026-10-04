@@ -857,9 +857,9 @@ fn help_command(ctx: &mut Context, id: PlayerId) {
 
 /// Entry point for chat messages sent by player `id`.
 ///
-/// Recognized commands return an empty string and ordinary chat is returned
-/// unchanged. Note the caller (`on_player_try_send_chat` in lib.rs) currently
-/// discards the returned string; only an `Err` suppresses the chat message.
+/// Recognized commands return an empty string, which the caller
+/// (`on_player_try_send_chat` in lib.rs) uses to hide them from chat.
+/// Ordinary chat is returned unchanged.
 pub(super) fn process(
     ctx: &mut Context,
     lua: HooksLua,

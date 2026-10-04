@@ -472,7 +472,9 @@ fn on_player_try_connect(
 }
 
 /// onPlayerTrySendChat hook, runs chat commands via `chatcmd::process`.
-/// On success the message is passed through unchanged (None). On error
+/// Recognized commands (for which `process` returns an empty string) are
+/// suppressed so they aren't shown in chat. Ordinary chat returns None so
+/// DCS, and other hook scripts, process the message unchanged. On error
 /// the error is sent to the player and the message is suppressed.
 fn on_player_try_send_chat(
     lua: HooksLua,
@@ -487,6 +489,9 @@ fn on_player_try_send_chat(
     let r = chatcmd::process(ctx, lua, start_ts, id, msg);
     record_perf(perf, start_ts);
     match r {
+        // returning the message itself would stop other hook scripts from
+        // seeing it, so only return Some to suppress
+        Ok(s) if s.is_empty() => Ok(Some("".into())),
         Ok(_) => Ok(None),
         Err(e) => {
             ctx.db.ephemeral.msgs().send(MsgTyp::Chat(Some(id)), format_compact!("{e}"));
