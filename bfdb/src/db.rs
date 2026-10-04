@@ -9,7 +9,7 @@ use bfprotocols::{
     },
     perf::PerfInner,
     shots::{Dead, Who},
-    stats::{DetectionSource, EnId, Pos, Stat},
+    stats::{DetectionSource, EnId, Pos, Stat, PATH},
 };
 use chrono::prelude::*;
 use dcso3::{
@@ -23,7 +23,8 @@ use dcso3::{
 use enumflags2::BitFlags;
 use fxhash::FxHashMap;
 use log::{error, info};
-use netidx::{path::Path as NetidxPath, subscriber::Subscriber};
+use netidx::{path::Path as NetidxPath, resolver_client::GlobSet, subscriber::Subscriber};
+use netidx_archive::{logfile::BatchItem, recorder_client::Client};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sled::{transaction::TransactionError, Db};
@@ -326,6 +327,13 @@ impl StatCtx {
     }
 }
 
+struct StatsReader {
+    client: Client,
+    /// the timestamp of the last stat batch read from the archive
+    cursor: Option<DateTime<Utc>>,
+    ctx: StatCtx,
+}
+
 #[derive(Clone)]
 pub(crate) struct StatsDbInner {
     subscriber: Subscriber,
@@ -414,62 +422,102 @@ impl StatsDb {
     }
 
     async fn background_loop(self) -> Result<()> {
-        use futures::{channel::mpsc, prelude::*, select_biased};
         use netidx::{
-            resolver_client::ChangeTracker,
-            subscriber::{Dval, Event, SubId, UpdatesFlags, Value},
+            chars::Chars,
+            resolver_client::{ChangeTracker, Glob},
         };
         use tokio::time;
         let resolver = self.subscriber.resolver();
+        let filter = GlobSet::new(true, [Glob::new(Chars::from(PATH))?])?;
         let mut timer = time::interval(Duration::from_secs(1));
-        let mut ctx: FxHashMap<SubId, (Dval, StatCtx)> = FxHashMap::default();
-        let mut by_path: FxHashMap<NetidxPath, SubId> = FxHashMap::default();
+        let mut readers: FxHashMap<NetidxPath, StatsReader> = FxHashMap::default();
         let mut ct = ChangeTracker::new(self.base.clone());
-        let (tx_res, mut rx_res) = mpsc::channel(10);
         loop {
-            select_biased! {
-                _ = timer.tick().fuse() => match resolver.check_changed(&mut ct).await {
-                    Err(e) => error!("failed to check changed {e:?}"),
-                    Ok(false) => (),
-                    Ok(true) => for path in resolver.list(self.base.clone()).await?.drain(..) {
-                        if let Some(sortie) = NetidxPath::basename(&path) {
-                            if self.include.as_ref().map(|r| r.is_match(sortie)).unwrap_or(true)
-                                && !self.exclude.as_ref().map(|r| r.is_match(sortie)).unwrap_or(false)
-                            {
-                                let path = path.append("stats");
-                                if !by_path.contains_key(&path) {
-                                    let dv = self.subscriber.subscribe(path.clone());
-                                    dv.updates(UpdatesFlags::empty(), tx_res.clone());
-                                    let id = dv.id();
-                                    ctx.insert(id, (dv, StatCtx::default()));
-                                    by_path.insert(path, id);
-                                }
-                            }
-                        }
-                    }
-                },
-                mut ev = rx_res.select_next_some() => {
-                    for (id, ev) in ev.drain(..) {
-                        if let Some((_dv, ctx)) = ctx.get_mut(&id) {
-                            if let Event::Update(Value::String(v)) = ev {
-                                let st: Stat = match serde_json::from_str(&v) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        error!("failed to parse stat {v} {e:?}");
-                                        continue
+            timer.tick().await;
+            match resolver.check_changed(&mut ct).await {
+                Err(e) => error!("failed to check changed {e:?}"),
+                Ok(false) => (),
+                Ok(true) => for path in resolver.list(self.base.clone()).await?.drain(..) {
+                    if let Some(sortie) = NetidxPath::basename(&path) {
+                        if self.include.as_ref().map(|r| r.is_match(sortie)).unwrap_or(true)
+                            && !self.exclude.as_ref().map(|r| r.is_match(sortie)).unwrap_or(false)
+                        {
+                            let path = path.append("stats");
+                            if !readers.contains_key(&path) {
+                                match self.open_reader(sortie, &path) {
+                                    Ok(r) => {
+                                        readers.insert(path, r);
                                     }
-                                };
-                                info!("adding stat {st:?}");
-                                if let Err(e) = task::block_in_place(|| self.add_stat(ctx, st)) {
-                                    error!("failed to add stat {e:?}")
+                                    Err(e) => error!("failed to open stats reader {path} {e:?}"),
                                 }
                             }
                         }
                     }
                 },
-                complete => break Ok(()),
+            }
+            for (path, reader) in readers.iter_mut() {
+                if let Err(e) = self.poll_reader(reader, &filter).await {
+                    error!("failed to read stats from {path} {e:?}")
+                }
             }
         }
+    }
+
+    /// Create a reader for the stats archive of a sortie, resuming from
+    /// the last stat recorded in the db for that sortie if any.
+    fn open_reader(&self, sortie: &str, path: &NetidxPath) -> Result<StatsReader> {
+        let client = Client::new(&self.subscriber, path)?;
+        let sortie = String::from(sortie);
+        let (ctx, cursor) = match self.seq.scan_prefix(&sortie)?.next_back().transpose()? {
+            None => (StatCtx::default(), None),
+            Some(((_, round), seq)) => match self.round.get(&(sortie.clone(), round))? {
+                Some(r) if r.end.is_none() => {
+                    let ctx = StatCtxInner { sortie, round, seq };
+                    (StatCtx(Some(ctx)), Some(seq))
+                }
+                Some(_) | None => (StatCtx::default(), Some(seq)),
+            },
+        };
+        info!("opened stats reader {path} resuming from {cursor:?}");
+        Ok(StatsReader { client, cursor, ctx })
+    }
+
+    /// Fetch and add all the stats recorded since the reader's cursor
+    async fn poll_reader(&self, reader: &mut StatsReader, filter: &GlobSet) -> Result<()> {
+        use netidx::subscriber::{Event, Value};
+        use tokio::time;
+        let oneshot = reader.client.oneshot(&reader.cursor, &None, filter);
+        let mut reply = time::timeout(Duration::from_secs(30), oneshot)
+            .await
+            .map_err(|_| anyhow!("timeout"))??;
+        for shard in reply.0.iter_mut() {
+            for (ts, batch) in shard.deltas.iter_mut() {
+                let ts = *ts;
+                // the start bound is inclusive, skip what we've already seen
+                if reader.cursor.map(|c| ts <= c).unwrap_or(false) {
+                    continue;
+                }
+                for BatchItem(_, ev) in batch.drain(..) {
+                    if let Event::Update(Value::String(v)) = ev {
+                        let st: Stat = match serde_json::from_str(&v) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("failed to parse stat {v} {e:?}");
+                                continue;
+                            }
+                        };
+                        info!("adding stat {st:?}");
+                        if let Err(e) =
+                            task::block_in_place(|| self.add_stat(&mut reader.ctx, ts, st))
+                        {
+                            error!("failed to add stat {e:?}")
+                        }
+                    }
+                }
+                reader.cursor = Some(ts);
+            }
+        }
+        Ok(())
     }
 
     fn new_round(
@@ -477,7 +525,6 @@ impl StatsDb {
         ctx: &mut StatCtx,
         start: DateTime<Utc>,
         sortie: String,
-        seqnum: SeqId,
     ) -> Result<()> {
         let id = RoundId::new(&self.db)?;
         let key = (sortie.clone(), id);
@@ -486,12 +533,12 @@ impl StatsDb {
             end: None,
             winner: None,
         };
-        self.seq.insert(&key, &seqnum)?;
+        self.seq.insert(&key, &start)?;
         self.round.insert(&key, &r)?;
         ctx.0 = Some(StatCtxInner {
             sortie,
             round: id,
-            seq: seqnum,
+            seq: start,
         });
         Ok(())
     }
@@ -511,6 +558,8 @@ impl StatsDb {
         round.end = Some(time);
         round.winner = winner;
         let _ = self.round.insert(&key, &round)?;
+        // record the RoundEnd position so a restarted reader resumes after it
+        self.seq.insert(&key, &time)?;
         ctx.0 = None;
         Ok(())
     }
@@ -643,18 +692,18 @@ impl StatsDb {
         })
     }
 
-    fn add_stat(&self, ctx: &mut StatCtx, stat: Stat) -> Result<()> {
+    fn add_stat(&self, ctx: &mut StatCtx, ts: DateTime<Utc>, stat: Stat) -> Result<()> {
         if let Some(ctx) = &ctx.0 {
-            if stat.seq <= ctx.seq {
+            if ts <= ctx.seq {
                 return Ok(());
             }
         }
-        if let Stat::NewRound { sortie } = &stat.kind {
+        if let Stat::NewRound { sortie } = &stat {
             if ctx.0.is_some() {
                 bail!("NewRound should only appear at the beginning of the stats or after RoundEnd")
             }
             match self.seq.scan_prefix(sortie)?.next_back().transpose()? {
-                None => return self.new_round(ctx, stat.time, sortie.clone(), stat.seq),
+                None => return self.new_round(ctx, ts, sortie.clone()),
                 Some(((_, round), seq)) => match self.round.get(&(sortie.clone(), round))? {
                     Some(r) if r.end.is_none() => {
                         ctx.0 = Some(StatCtxInner {
@@ -665,20 +714,20 @@ impl StatsDb {
                         return Ok(());
                     }
                     Some(_) | None => {
-                        return self.new_round(ctx, stat.time, sortie.clone(), stat.seq)
+                        return self.new_round(ctx, ts, sortie.clone())
                     }
                 },
             }
         }
-        if let Stat::RoundEnd { winner } = &stat.kind {
-            return self.round_end(ctx, stat.time, *winner);
+        if let Stat::RoundEnd { winner } = &stat {
+            return self.round_end(ctx, ts, *winner);
         }
         let ctx = ctx.get_mut()?;
-        match stat.kind {
+        match stat {
             Stat::NewRound { .. } | Stat::RoundEnd { .. } => unreachable!(),
             Stat::SessionStart { stop, cfg } => {
                 self.session.insert(
-                    &(ctx.round, stat.time),
+                    &(ctx.round, ts),
                     &Session {
                         cfg: (*cfg).clone(),
                         stop_time: stop,
@@ -703,7 +752,7 @@ impl StatsDb {
                             api: api_perf,
                             engine: perf,
                             frame,
-                            time: stat.time,
+                            time: ts,
                         });
                         self.session.insert(&k, &session)?;
                     }
@@ -724,7 +773,7 @@ impl StatsDb {
                         kind,
                         owner,
                         by: None,
-                        last_change: stat.time,
+                        last_change: ts,
                         health: 100,
                         logi: 100,
                         supply: 100,
@@ -857,18 +906,18 @@ impl StatsDb {
             } => {
                 self.pilots.saw_pilot(id, name)?;
                 self.pilots.with_pilot_round_info(id, ctx.round, |ri| {
-                    ri.side = (stat.time, side);
+                    ri.side = (ts, side);
                     ri.points = initial_points;
                 })?;
             }
             Stat::Sideswitch { id, side } => {
                 self.pilots
-                    .with_pilot_round_info(id, ctx.round, |ri| ri.side = (stat.time, side))?;
+                    .with_pilot_round_info(id, ctx.round, |ri| ri.side = (ts, side))?;
             }
             Stat::Connect { id, addr, name } => {
                 self.pilots.saw_pilot(id, name)?;
                 self.pilots.with_pilot_round_info(id, ctx.round, |ri| {
-                    ri.connected = Some((stat.time, addr.clone()))
+                    ri.connected = Some((ts, addr.clone()))
                 })?;
             }
             Stat::Disconnect { id } => {
@@ -878,7 +927,7 @@ impl StatsDb {
             Stat::Slot { id, slot, typ } => {
                 self.pilots.with_pilot_round_info(id, ctx.round, |ri| {
                     ri.slot = Some(Slot {
-                        time: stat.time,
+                        time: ts,
                         id: slot,
                         vehicle: typ.as_ref().map(|u| u.typ.clone()),
                         sortie: None,
@@ -960,7 +1009,7 @@ impl StatsDb {
                 self.pilots.sortie.insert(
                     &(id, ctx.round, sid),
                     &Sortie {
-                        takeoff: stat.time,
+                        takeoff: ts,
                         land: None,
                         vehicle,
                     },
@@ -975,7 +1024,7 @@ impl StatsDb {
                 })?;
                 let sid = sid.ok_or_else(|| anyhow!("{id} landed without taking off"))?;
                 self.pilots
-                    .with_sortie((id, ctx.round, sid), |s| s.land = Some(stat.time))?;
+                    .with_sortie((id, ctx.round, sid), |s| s.land = Some(ts))?;
             }
             Stat::Life { id, lives } => {
                 self.pilots.with_pilot_round_info(id, ctx.round, |ri| {
@@ -1005,6 +1054,16 @@ impl StatsDb {
                 self.pilots
                     .with_pilot_round_info(to, ctx.round, |ri| ri.points += points as i32)?;
             }
+            Stat::PointsTransferToObjective { from, to: _, points } => {
+                self.pilots
+                    .with_pilot_round_info(from, ctx.round, |ri| ri.points -= points as i32)?;
+                self.pilots.with_pilot_and_aggregates(
+                    from,
+                    ctx.round,
+                    |p| p.total.donated_points += points,
+                    |a| a.donated_points += points,
+                )?;
+            }
             Stat::Bind { id, token } => {
                 let token = Uuid::from_str(&token)?;
                 let mut remove = None;
@@ -1021,8 +1080,8 @@ impl StatsDb {
             }
         };
         self.seq
-            .insert(&(ctx.sortie.clone(), ctx.round), &stat.seq)?;
-        ctx.seq = stat.seq;
+            .insert(&(ctx.sortie.clone(), ctx.round), &ts)?;
+        ctx.seq = ts;
         Ok(())
     }
 }

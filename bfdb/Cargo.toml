@@ -24,7 +24,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 compact_str = { workspace = true }
 dcso3 = { version = "0.2", path = "../dcso3" }
-enumflags2 = { workspace = true }
+enumflags2 = { workspace = true, features = ["serde"] }
 env_logger = { workspace = true }
 futures = { workspace = true }
 fxhash = { workspace = true }
@@ -33,6 +33,7 @@ log = { workspace = true }
 mlua = { version = "0.9.9", features = ["lua51", "serialize"] }
 netidx-protocols = { workspace = true }
 netidx = { workspace = true }
+netidx-archive = { workspace = true }
 paste = { workspace = true }
 pin-project = { workspace = true }
 regex = { workspace = true }
