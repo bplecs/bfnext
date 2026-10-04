@@ -126,8 +126,9 @@ fn encode<T: Serialize>(db: &T) -> Result<BytesMut> {
     })
 }
 
-/// Move the existing save file at `path` (if any) aside as a timestamped
-/// backup, then thin out old backups.
+/// Copy the existing save file at `path` (if any) to a timestamped backup,
+/// then thin out old backups. The save itself is left in place, so there
+/// is always a save at `path` until [`save`] atomically replaces it.
 ///
 /// Backups are named `<file name><unix timestamp in seconds>` and live next
 /// to `path`. Backups are grouped into age buckets (minute, ten minutes,
@@ -147,7 +148,10 @@ fn rotate_state(path: &Path) -> Result<()> {
         let mut backup = CompactString::from(name);
         write!(backup, "{}", now.timestamp()).unwrap();
         with_ts.set_file_name(backup);
-        fs::rename(path, with_ts)?;
+        // a hard link is cheap, fall back to a copy if the fs doesn't support it
+        if fs::hard_link(path, &with_ts).is_err() {
+            fs::copy(path, &with_ts)?;
+        }
         let dir = path
             .parent()
             .ok_or_else(|| anyhow!("path has no parent dir"))?;
@@ -222,10 +226,12 @@ fn rotate_state(path: &Path) -> Result<()> {
 
 /// Write the encoded campaign state to `path`, zstd compressed (level 9).
 ///
-/// The data is first written to `path` with a `.tmp` extension, then the
-/// previous save is rotated into the backups (see [`rotate_state`]) and the
-/// temp file is renamed into place, so a crash mid write never leaves a
-/// truncated save. Rotation failures are logged but don't fail the save.
+/// The data is first written to `path` with a `.tmp` extension and synced
+/// to disk, then the previous save is backed up (see [`rotate_state`]) and
+/// the temp file is renamed over it. The rename replaces the save
+/// atomically, so a crash at any point leaves either the old or the new
+/// save at `path`, never a missing or truncated one. Rotation failures are
+/// logged but don't fail the save.
 async fn save(path: PathBuf, encoded: Bytes) -> Result<()> {
     task::spawn_blocking(move || {
         use std::fs::File;
@@ -236,8 +242,11 @@ async fn save(path: PathBuf, encoded: Bytes) -> Result<()> {
             .truncate(true)
             .create(true)
             .open(&tmp)?;
-        let mut file = zstd::stream::Encoder::new(file, 9)?.auto_finish();
-        io::copy(&mut &*encoded, &mut file)?;
+        let mut enc = zstd::stream::Encoder::new(file, 9)?;
+        io::copy(&mut &*encoded, &mut enc)?;
+        // finish explicitly, auto_finish would silently drop a failed final write
+        let file = enc.finish()?;
+        file.sync_all()?;
         drop(file);
         if let Err(e) = rotate_state(&path) {
             error!("failed to rotate backup files {e:?}")
