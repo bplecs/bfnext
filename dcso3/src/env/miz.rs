@@ -78,7 +78,7 @@ impl GroupId {
 // humans. Unrecognized strings become `Custom`.
 string_enum!(Skill, u8, [
     Client => "Client",
-    Excellant => "Excellant",
+    Excellent => "Excellent",
     Player => "Player",
     Average => "Average",
     Good => "Good",

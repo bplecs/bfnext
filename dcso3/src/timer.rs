@@ -113,13 +113,13 @@ impl<'lua> Timer<'lua> {
         ))
     }
 
-    /// Intended to change when a scheduled function next runs
-    /// (`timer.setFunctionTime`), but note that it currently calls
-    /// `timer.removeFunction`.
+    /// Change when scheduled function `id` next runs to model time `when`.
+    /// Calls `timer.setFunctionTime`. There is no dedicated perf counter, so
+    /// the call is recorded under `timer_remove_function`.
     pub fn set_function_time(&self, id: FunId, when: f64) -> Result<()> {
         Ok(record_perf!(
             timer_remove_function,
-            self.t.call_function("removeFunction", (id, when))?
+            self.t.call_function("setFunctionTime", (id, when))?
         ))
     }
 }

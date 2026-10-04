@@ -104,9 +104,9 @@ impl<'lua> Airbase<'lua> {
         Ok(self.t.call_method("getUnit", i)?)
     }
 
-    /// The airbase's DCS id. Calls the method `getId`.
+    /// The airbase's DCS id. Calls `Airbase:getID`.
     pub fn get_id(&self) -> Result<AirbaseId> {
-        Ok(self.t.call_method("getId", ())?)
+        Ok(self.t.call_method("getID", ())?)
     }
 
     /// The airbase's parking spots. `available` is passed to
