@@ -22,6 +22,15 @@ The delay is controlled by the 'ewr_delay' configuration option (in seconds, def
 The default mode is EwrMode::Original to maintain backward compatibility.
 */
 
+//! Early warning radar picture for players.
+//!
+//! Each side's EWR units (see [`Db::ewrs`]) track airborne players and AI
+//! action aircraft within range and line of sight. [`Ewr::update_tracks`]
+//! refreshes the per-side track tables and publishes detection stats, and
+//! [`Ewr::where_chicken`] turns a side's tracks into BRAA style reports
+//! (bearing, range, altitude, speed, heading, age) relative to a player.
+//! Players can toggle automatic reports and choose metric or imperial units.
+
 use crate::{
     db::{
         Db,
@@ -43,18 +52,28 @@ use fxhash::FxHashMap;
 use smallvec::{SmallVec, smallvec};
 use std::fmt;
 
+/// One line of an EWR report about a single contact.
+///
+/// Values are created in SI units (meters, m/s) with `units` set to
+/// [`EwrUnits::Metric`], and are only meaningful for display after
+/// [`GibBraa::convert`] has been applied.
 #[derive(Debug, Clone, Copy)]
 pub struct GibBraa {
+    /// bearing from the player to the contact in degrees
     pub bearing: u16,
     pub range: u32,
     pub altitude: u32,
+    /// the contact's heading in degrees
     pub heading: u16,
     pub speed: u16,
+    /// seconds since the contact was last detected
     pub age: u16,
     pub units: EwrUnits,
+    /// guards against converting twice
     converted: bool,
 }
 
+/// Column header matching the [`GibBraa`] display format.
 pub const HEADER: &'static str = "BRG      RNG      ALT      SPD        HDG      AGE";
 
 impl fmt::Display for GibBraa {
@@ -80,6 +99,10 @@ impl fmt::Display for GibBraa {
 }
 
 impl GibBraa {
+    /// Convert from SI units to display units, rounding speed to the nearest
+    /// 100 and altitude to the nearest 100 (below 1000) or 1000. Metric gives
+    /// km, m, km/h; imperial gives nm, ft, kts. Range is truncated. Only the
+    /// first call has any effect.
     fn convert(&mut self, unit: EwrUnits) {
         if self.converted {
             return;
@@ -114,17 +137,23 @@ impl GibBraa {
     }
 }
 
+/// What one side's EWR network knows about one aircraft.
 #[derive(Debug, Clone, Copy, Default)]
 struct Track {
     pos: Position3,
+    /// velocity in m/s
     velocity: Vector3,
     last: DateTime<Utc>,          // Last detection time (for age calculation)
     last_update: DateTime<Utc>,   // Last data update time (for delay mechanism)
+    /// the side the tracked aircraft belongs to
     side: Side,
+    /// `detected` as of the previous update, used to publish only changes
     was_detected: bool,
+    /// detected by an enemy EWR during the current update
     detected: bool,
 }
 
+/// Units used to display EWR reports.
 #[derive(Debug, Clone, Copy)]
 pub enum EwrUnits {
     Imperial,
@@ -137,10 +166,13 @@ impl Default for EwrUnits {
     }
 }
 
+/// Per-player EWR preferences.
 #[derive(Debug, Clone, Copy)]
 struct PlayerState {
+    /// whether automatic reports are on (forced reports ignore this)
     enabled: bool,
     units: EwrUnits,
+    /// when the player was last sent a report
     last: DateTime<Utc>,
 }
 
@@ -154,13 +186,26 @@ impl Default for PlayerState {
     }
 }
 
+/// The EWR state for all sides. See the module docs.
 #[derive(Debug, Clone, Default)]
 pub struct Ewr {
+    /// EWR owning side -> tracked aircraft (of any side)
     tracks: FxHashMap<Side, FxHashMap<EnId, Track>>,
     player_state: FxHashMap<Ucid, PlayerState>,
 }
 
 impl Ewr {
+    /// Update every side's tracks with the aircraft its EWRs can see.
+    ///
+    /// Candidates are airborne players and airborne units of AI action
+    /// groups. An aircraft is seen by an EWR if it is within the EWR's range
+    /// and has line of sight from 10m above the radar. A side's EWRs track
+    /// friendly aircraft too, but only detection by an enemy EWR counts as
+    /// "detected"; changes in that state are published as stats.
+    ///
+    /// In [`EwrMode::Delayed`] a track's position and velocity are only
+    /// refreshed once every `ewr_delay` seconds, though its detection time
+    /// is still updated on every sighting.
     pub fn update_tracks(
         &mut self,
         lua: MizLua,
@@ -210,6 +255,7 @@ impl Ewr {
             ewr_pos.y += 10.; // factor in antenna height
             for (id, obj_side, pos, velocity) in &aircraft {
                 let track = tracks.entry(*id).or_default();
+                // already seen by another of this side's EWRs this update
                 if track.last != now {
                     let dist = na::distance_squared(&ewr_pos.into(), &pos.p.0.into());
                     if dist <= range {
@@ -255,6 +301,7 @@ impl Ewr {
         Ok(())
     }
 
+    /// Toggle automatic EWR reports for a player, returning the new state.
     pub fn toggle(&mut self, ucid: &Ucid) -> bool {
         let st = self.player_state.entry(ucid.clone()).or_default();
         st.enabled = !st.enabled;
@@ -265,6 +312,20 @@ impl Ewr {
         self.player_state.entry(ucid.clone()).or_default().units = units;
     }
 
+    /// Build an EWR report for a player from their side's tracks.
+    ///
+    /// Reports on friendly contacts if `friendly`, otherwise enemy contacts,
+    /// excluding the player's own aircraft and anything not detected in the
+    /// last 120 seconds (such tracks are also dropped). At most the 10
+    /// closest contacts are returned, sorted by range, converted to the
+    /// player's units.
+    ///
+    /// Returns an empty report if the player has reports disabled (unless
+    /// `force`), or if it isn't time for a report yet. In
+    /// [`EwrMode::Original`] a report is due after 60s, immediately when the
+    /// closest contact is within 20km and fresh (<= 10s old), or after 30s
+    /// when it is within 40km and fresh. In [`EwrMode::Delayed`] a report is
+    /// due every `ewr_delay` seconds. `force` always produces a report.
     pub fn where_chicken(
         &mut self,
         now: DateTime<Utc>,

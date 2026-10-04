@@ -14,6 +14,23 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Rate limited outgoing message queue.
+//!
+//! Everything the campaign shows to players, chat replies, on screen panel
+//! messages, F10 map marks, and F10 map markup (circles, lines, text, etc.),
+//! is queued here instead of being sent directly. The main timer loop in
+//! `lib.rs` calls [`MsgQ::process`] once per tick (about once per second)
+//! with `max_msgs_per_second` from the config, so a burst of messages, e.g.
+//! redrawing every objective, can't stall the DCS frame.
+//!
+//! There are three priority queues, drained strictly in order:
+//! - 0: chat and panel text messages
+//! - 1: marks, text markup, and mark deletions
+//! - 2: shape markup (circles, rects, quads, arrows) and markup updates
+//!
+//! A lower priority queue is only processed once every higher priority
+//! queue is empty.
+
 use dcso3::{
     Color, LuaVec3, String, Vector2, Vector3,
     coalition::Side,
@@ -24,6 +41,7 @@ use dcso3::{
 use log::error;
 use std::collections::VecDeque;
 
+/// Who should see an on screen (panel) text message
 #[derive(Debug, Clone, Copy)]
 pub enum PanelDest {
     All,
@@ -32,6 +50,7 @@ pub enum PanelDest {
     Unit(UnitId),
 }
 
+/// Who should see an F10 map mark
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub enum MarkDest {
@@ -40,14 +59,21 @@ pub enum MarkDest {
     Group(GroupId),
 }
 
+/// How and to whom a text message is delivered
 #[derive(Debug, Clone)]
 pub enum MsgTyp {
+    /// a chat message, to everyone if None, otherwise privately to the
+    /// specified player
     Chat(Option<PlayerId>),
+    /// an on screen text message
     Panel {
         to: PanelDest,
+        /// how long the message stays on screen in seconds
         display_time: i64,
+        /// remove previous messages from the screen first
         clear_view: bool,
     },
+    /// an F10 map mark with the message as its text
     Mark {
         id: MarkId,
         to: MarkDest,
@@ -56,6 +82,8 @@ pub enum MsgTyp {
     },
 }
 
+/// Something to display. Except for `Message` these are F10 map markup
+/// operations, the `Set*` variants modify markup that was already drawn.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum Msg {
@@ -114,12 +142,16 @@ pub enum Msg {
     },
 }
 
+/// A queued operation
 #[derive(Debug, Clone)]
 pub enum Cmd {
     Send(Msg),
+    /// remove a mark or markup from the F10 map
     DeleteMark(MarkId),
 }
 
+/// The message queue, one `VecDeque` per priority, index 0 is the highest
+/// priority. Always has exactly three queues.
 #[derive(Debug, Clone)]
 pub struct MsgQ(Vec<VecDeque<Cmd>>);
 
@@ -141,11 +173,17 @@ impl MsgQ {
         }))
     }
 
+    /// Queue a text message at the highest priority
     pub fn send<S: Into<String>>(&mut self, typ: MsgTyp, text: S) {
         self.send_with_priority(0, typ, text)
     }
 
+    /// Delete a mark or markup. Any queued updates to `did` are dropped. If
+    /// the shape that creates `did` is still queued it is dropped too and
+    /// no delete is sent, since DCS never saw it. Otherwise a delete is
+    /// queued at priority 1.
     pub fn delete_mark(&mut self, did: MarkId) {
+        // false if we removed the queued creation of did
         let mut push = true;
         let mut remove = |pri: usize| {
             self.0[pri].retain(|cmd| match cmd {
@@ -180,6 +218,9 @@ impl MsgQ {
         }
     }
 
+    /// Queue an F10 mark visible to everyone at `position` (a 2d map
+    /// position, x and z in DCS coordinates). Returns the mark id, which
+    /// can later be passed to `delete_mark`.
     #[allow(dead_code)]
     pub fn mark_to_all<S: Into<String>>(
         &mut self,
@@ -201,6 +242,7 @@ impl MsgQ {
         id
     }
 
+    /// Like `mark_to_all`, but only visible to `side`
     pub fn mark_to_side<S: Into<String>>(
         &mut self,
         side: Side,
@@ -222,6 +264,7 @@ impl MsgQ {
         id
     }
 
+    /// Like `mark_to_all`, but only visible to `group`
     #[allow(dead_code)]
     pub fn mark_to_group<S: Into<String>>(
         &mut self,
@@ -244,6 +287,9 @@ impl MsgQ {
         id
     }
 
+    /// Queue an on screen message for everyone. `display_time` is in
+    /// seconds, `clear_view` removes previous messages first. The other
+    /// `panel_to_*` functions are the same but for a narrower audience.
     #[allow(dead_code)]
     pub fn panel_to_all<S: Into<String>>(&mut self, display_time: i64, clear_view: bool, text: S) {
         self.send_with_priority(
@@ -311,6 +357,9 @@ impl MsgQ {
         )
     }
 
+    /// Queue drawing a circle on the F10 map for the sides in `to`. The
+    /// caller allocates `id` so it can update or delete the shape later.
+    /// The other shape functions work the same way.
     pub fn circle_to_all(
         &mut self,
         to: SideFilter,
@@ -357,6 +406,8 @@ impl MsgQ {
         }))
     }
 
+    /// Queue a text label on the F10 map. Unlike the other shapes this is
+    /// queued at priority 1.
     pub fn text_to_all(&mut self, to: SideFilter, id: MarkId, spec: TextSpec) {
         self.0[1].push_back(Cmd::Send(Msg::Text { id, to, spec }))
     }
@@ -376,6 +427,8 @@ impl MsgQ {
         }))
     }
 
+    /// Change the line color of existing markup `id`. The other
+    /// `set_markup_*` functions likewise modify existing markup.
     pub fn set_markup_color(&mut self, id: MarkId, color: Color) {
         self.0[2].push_back(Cmd::Send(Msg::SetMarkupColor { id, color }))
     }
@@ -397,10 +450,13 @@ impl MsgQ {
         self.0[2].push_back(Cmd::Send(Msg::SetMarkupEnd { id, pos }))
     }
 
+    /// Total number of queued commands across all priorities
     pub fn len(&self) -> usize {
         self.0.iter().fold(0, |acc, q| acc + q.len())
     }
 
+    /// Send up to `max_rate` queued commands to DCS, highest priority
+    /// first. Errors are logged and the failed command is dropped.
     pub fn process(&mut self, max_rate: usize, net: &Net, act: &Action) {
         for _ in 0..max_rate {
             let cmd = match self.0[0].pop_front() {
@@ -432,6 +488,7 @@ impl MsgQ {
                     },
                     MsgTyp::Chat(to) => match to {
                         None => net.send_chat(text, true),
+                        // sent as if from player id 1, the server
                         Some(id) => net.send_chat_to(text, id, Some(PlayerId::from(1))),
                     },
                     MsgTyp::Panel {

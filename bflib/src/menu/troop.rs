@@ -14,6 +14,19 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! F10 "Troops" radio menu for transport-capable aircraft.
+//!
+//! Lets pilots load infantry squads at friendly logistics hubs, unload them
+//! into the field as spawned groups, extract deployed squads back aboard, or
+//! return them to logistics for a points refund. The real work is done by the
+//! `Db` cargo methods (`db/cargo.rs`); these handlers resolve the slot, call
+//! into the db, and report the result. Success is announced to the whole
+//! side, failures are shown only to the requesting group.
+//!
+//! Loading and unloading also pin the relevant JTAC id in the slot's JTAC
+//! menu (a squad with a JTAC spec makes the carrying slot a JTAC while
+//! aboard, and the deployed group a JTAC once unloaded) and rebuild that menu.
+
 use super::{cargo, player_name, slot_for_group, ArgTuple};
 use crate::{jtac::JtId, Context};
 use anyhow::{Context as ErrContext, Result};
@@ -23,6 +36,13 @@ use dcso3::{
     coalition::Side, env::miz::GroupId, mission_commands::MissionCommands, MizLua, String,
 };
 
+/// Menu handler: load the squad named `arg.snd` into the aircraft of group `arg.fst`.
+///
+/// On success the carrying slot is pinned in that slot's JTAC menu (it only
+/// becomes a live JTAC if the squad has a JTAC spec) and the logistics
+/// objective the troops were loaded from is subscribed. The side is then told
+/// how many of this squad type are deployed and what happens when the limit
+/// is exceeded.
 fn load_troops(lua: MizLua, arg: ArgTuple<GroupId, String>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (side, slot) = slot_for_group(lua, ctx, &arg.fst).context("getting slot for group")?;
@@ -71,6 +91,11 @@ fn load_troops(lua: MizLua, arg: ArgTuple<GroupId, String>) -> Result<()> {
     Ok(())
 }
 
+/// Menu handler: unload the most recently loaded squad from group `gid`'s
+/// aircraft as a new ground group at its position (must be landed).
+///
+/// The new group is pinned in the slot's JTAC menu (in case it is a JTAC
+/// squad) and the nearest objective, if any, is subscribed.
 fn unload_troops(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (side, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -95,6 +120,8 @@ fn unload_troops(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// Menu handler: pick up a friendly deployed squad within crate load
+/// distance of group `gid`'s aircraft, deleting the ground group.
 fn extract_troops(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (side, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -113,6 +140,8 @@ fn extract_troops(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// Menu handler: hand the most recently loaded squad back to friendly
+/// logistics, refunding its point cost. Requires being landed near logistics.
 fn return_troops(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (side, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -131,6 +160,9 @@ fn return_troops(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// Build the "Troops" submenu for a player group: Unload/Extract/List/Return
+/// commands plus a "Squads" submenu with one Load command per squad
+/// configured for `side`. Does nothing if `side` has no troops configured.
 pub(super) fn add_troops_menu_for_group(
     cfg: &Cfg,
     mc: &MissionCommands,

@@ -14,6 +14,33 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! bflib, the Fowl Engine campaign mission script.
+//!
+//! This crate is built as a DLL that DCS loads with a Lua `require`. The
+//! [`bflib`] module entry point returns a table with two functions,
+//! `initHooks`, called from the server hooks environment, and `initMiz`,
+//! called from the mission scripting environment. DCS runs each in a
+//! separate Lua state, so the code here receives either a [`HooksLua`] or a
+//! [`MizLua`] depending on which side it was called from.
+//!
+//! - [`init_hooks`] registers the server hooks: player connect, chat, slot
+//!   change, disconnect, mission load end, and simulation frame. These
+//!   decide who may join, which slots they may take, and process chat
+//!   commands.
+//! - [`init_miz`] waits for the mission to finish loading, then
+//!   [`delayed_init_miz`] indexes the miz, registers the world event
+//!   handler ([`on_event`]), loads (or initializes) the campaign state and
+//!   config, respawns the persisted groups, and starts the timer loop.
+//! - [`run_timed_events`] runs about once per second of mission time. It
+//!   updates unit positions, processes the spawn and message queues,
+//!   logistics, captures, and queued admin/action/jtac commands. Heavier
+//!   work (EWR, jtac contacts, culling, repairs, snapshots) runs in
+//!   [`run_slow_timed_events`] at the configured slower frequency.
+//!
+//! All state lives in the [`Context`] singleton. Work that would block the
+//! game thread (saving state, logging, stats, netidx) is sent to the
+//! background tokio runtime in [`bg`].
+
 mod admin;
 mod bg;
 mod chatcmd;
@@ -85,13 +112,17 @@ use std::{
 };
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
+/// What we know about a connected player
 #[derive(Debug, Clone)]
 struct PlayerInfo {
     name: String,
+    /// ip address, if DCS provided one
     addr: Option<String>,
     ucid: Ucid,
 }
 
+/// The currently connected players, indexed by player id, ucid, name, and
+/// address. Only one connection is allowed per name and per address.
 #[derive(Debug, Default)]
 struct Connected {
     info_by_player_id: FxHashMap<PlayerId, PlayerInfo>,
@@ -113,6 +144,9 @@ impl Connected {
         self.id_by_name.get(name).and_then(|id| self.info_by_player_id.get(id))
     }
 
+    /// Get the info for player `id`, asking DCS and adding them to the
+    /// connected set if we don't know them yet. Fails if DCS has no ucid
+    /// for the player, or if `player_connected` rejects them.
     fn get_or_lookup_player_info<'a, 'lua, L: LuaEnv<'lua>>(
         &'a mut self,
         lua: L,
@@ -133,6 +167,10 @@ impl Connected {
         }
     }
 
+    /// Record a newly connected player. A stale connection with the same
+    /// ucid is removed first (e.g. a reconnect). Fails, with a message
+    /// suitable for showing the player, if the name or address is already
+    /// in use by another connection.
     pub fn player_connected(&mut self, id: PlayerId, ifo: PlayerInfo) -> Result<()> {
         if let Some(id) = self.id_by_ucid.remove(&ifo.ucid) {
             self.player_disconnected(id);
@@ -150,6 +188,8 @@ impl Connected {
         Ok(())
     }
 
+    /// Remove a player from every index, returning their info if they were
+    /// connected
     pub fn player_disconnected(&mut self, id: PlayerId) -> Option<PlayerInfo> {
         self.info_by_player_id.remove(&id).map(|ifo| {
             self.id_by_name.remove(&ifo.name);
@@ -160,6 +200,8 @@ impl Connected {
     }
 }
 
+/// A scheduled automatic server restart (from the `shutdown` config
+/// setting) and which countdown warnings have already been shown
 #[derive(Debug, Clone, Copy, Default)]
 struct AutoShutdown {
     when: DateTime<Utc>,
@@ -177,9 +219,13 @@ impl AutoShutdown {
     }
 }
 
+/// Server startup progress. Players can't connect until `Running`.
 #[derive(Debug, Clone, Copy)]
 enum LoadState {
+    /// the mission hasn't finished loading
     Init,
+    /// the mission finished loading at `time`, the campaign is initializing.
+    /// Becomes `Running` one minute after `time`.
     MissionLoaded { time: DateTime<Utc> },
     Running,
 }
@@ -191,6 +237,7 @@ impl Default for LoadState {
 }
 
 impl LoadState {
+    /// None if players may connect, otherwise the rejection reason
     fn login_ok(&self) -> Option<String> {
         match self {
             Self::Running => None,
@@ -204,6 +251,8 @@ impl LoadState {
         }
     }
 
+    /// True once the mission has been loaded for at least one second, at
+    /// which point the campaign may be initialized
     fn init_ok(&self) -> bool {
         match self {
             Self::Init => false,
@@ -212,6 +261,7 @@ impl LoadState {
         }
     }
 
+    /// Advance from `MissionLoaded` to `Running` once a minute has passed
     fn step(&mut self) {
         match self {
             Self::Running | Self::Init => (),
@@ -224,39 +274,64 @@ impl LoadState {
     }
 }
 
+/// The jtac menu state for a slot
 #[derive(Debug, Default)]
 struct JtacSlotIfo {
+    /// objectives whose jtacs are shown in the slot's jtac menu. The menu
+    /// is rebuilt when their contacts change.
     subscribed_objectives: FxHashSet<ObjectiveId>,
+    /// jtacs the player pinned, their objectives stay subscribed when
+    /// contacts change
     pinned: FxHashSet<JtId>,
 }
 
+/// All of the campaign's runtime state. There is exactly one, accessed via
+/// the unsafe `Context::get_mut` singleton, see the comment there.
 #[derive(Debug, Default)]
 struct Context {
+    /// the sortie name from the miz, used to name the state file
     sortie: String,
     event_handler_id: Option<HandlerId>,
+    /// path of the saved campaign state, `<DCS write dir>/<sortie>`
     miz_state_path: PathBuf,
     shutdown: Option<AutoShutdown>,
     last_perf_log: DateTime<Utc>,
     load_state: LoadState,
     idx: env::miz::MizIndex,
     db: Db,
+    /// admin commands submitted over netidx rpc by the background thread
     external_admin_commands: Arc<SegQueue<(AdminCommand, oneshot::Sender<Value>)>>,
+    /// admin commands from chat, waiting to run in the miz environment
     admin_commands: Vec<(admin::Caller, AdminCommand)>,
+    /// action chat commands waiting to run in the miz environment
     action_commands: Vec<(PlayerId, String)>,
+    /// jtac chat commands waiting to run in the miz environment
     jtac_commands: Vec<(PlayerId, JtId, String)>,
     to_background: Option<UnboundedSender<bg::Task>>,
+    /// units that landed and when. Once on the ground for 10 seconds a
+    /// life may be returned, see `return_lives`.
     recently_landed: FxHashMap<DcsOid<ClassUnit>, DateTime<Utc>>,
+    /// units born in the last ~5 seconds. Takeoff and land events for
+    /// these are ignored.
     recently_born: FxHashMap<DcsOid<ClassUnit>, DateTime<Utc>>,
     airborne: FxHashSet<DcsOid<ClassUnit>>,
+    /// how many consecutive ticks each objective has been capturable, used
+    /// to announce it once it's been capturable for a while
     captureable: FxHashMap<ObjectiveId, usize>,
     shots_out: ShotDb,
+    /// slots whose F10 menus need to be built. One is processed per tick
+    /// to spread out the cost.
     menu_init_queue: IndexSet<SlotId, FxBuildHasher>,
     last_frame: Option<DateTime<Utc>>,
     last_slow_timed_events: DateTime<Utc>,
     last_periodic_points: DateTime<Utc>,
+    /// cursor for the incremental unit position update
     last_unit_position: usize,
+    /// cursor for the incremental player position update
     last_player_position: usize,
     subscribed_jtac_menus: FxHashMap<SlotId, JtacSlotIfo>,
+    /// slots whose action menu has been expanded. Their menu is rebuilt
+    /// when the player adds a mark, since marks are action targets.
     subscribed_action_menus: FxHashSet<SlotId>,
     connected: Connected,
     landcache: LandCache,
@@ -290,12 +365,15 @@ impl Context {
         unsafe { Context::get_mut() }
     }
 
+    /// Replace the context with a fresh default one, used at mission end
     unsafe fn reset() {
         unsafe {
             *Self::get_mut() = Self::default();
         }
     }
 
+    /// Send a task to the background thread. Does nothing if the
+    /// background thread hasn't been started, panics if it has died.
     fn do_bg_task(&self, task: bg::Task) {
         if let Some(to_bg) = &self.to_background {
             match to_bg.send(task) {
@@ -305,6 +383,7 @@ impl Context {
         }
     }
 
+    /// Start the background thread if it isn't already running
     fn init_async_bg(&mut self, lua: &Lua) -> Result<()> {
         if self.to_background.is_none() {
             let write_dir = PathBuf::from(Lfs::singleton(lua)?.writedir()?.as_str());
@@ -313,12 +392,14 @@ impl Context {
         Ok(())
     }
 
+    /// Spawn every persisted group after the state is loaded or initialized
     fn respawn_groups(&mut self, lua: MizLua, miz: &Miz) -> Result<()> {
         let spctx = SpawnCtx::new(lua)?;
         let perf = Arc::make_mut(&mut unsafe { Perf::get_mut() }.inner);
         self.db.respawn_after_load(lua, perf, &self.idx, miz, &mut self.landcache, &spctx)
     }
 
+    /// Log perf counters in the background, at most once a minute
     fn log_perf(&mut self, now: DateTime<Utc>) {
         if now - self.last_perf_log > Duration::seconds(60) {
             self.last_perf_log = now;
@@ -332,6 +413,11 @@ impl Context {
     }
 }
 
+/// onPlayerTryConnect hook. Returns None to accept the player, or
+/// Some(reason) to reject them. Players are rejected while the server is
+/// loading, if their name fails the configured name filter, if they are
+/// banned, or if their name or address is already connected. Expired bans
+/// are removed here.
 fn on_player_try_connect(
     _: HooksLua,
     addr: String,
@@ -385,6 +471,9 @@ fn on_player_try_connect(
     Ok(None)
 }
 
+/// onPlayerTrySendChat hook, runs chat commands via `chatcmd::process`.
+/// On success the message is passed through unchanged (None). On error
+/// the error is sent to the player and the message is suppressed.
 fn on_player_try_send_chat(
     lua: HooksLua,
     id: PlayerId,
@@ -406,6 +495,7 @@ fn on_player_try_send_chat(
     }
 }
 
+/// Tell a player in chat why they couldn't take a slot
 fn process_slot_rejection(ctx: &mut Context, id: PlayerId, ucid: Ucid, rej: SlotAuth) {
     match rej {
         SlotAuth::Denied => {
@@ -454,6 +544,9 @@ fn process_slot_rejection(ctx: &mut Context, id: PlayerId, ucid: Ucid, rej: Slot
     }
 }
 
+/// Decide whether a player may take `slot`, returning true if they may. A
+/// player who isn't registered yet is registered on the slot's side and
+/// the check is retried.
 fn try_occupy_slot(
     ctx: &mut Context,
     lua: HooksLua,
@@ -500,6 +593,8 @@ fn try_occupy_slot(
     }
 }
 
+/// onPlayerTryChangeSlot hook. Returns Some(false) to deny the slot change
+/// (including on any error), or None to allow it.
 fn on_player_try_change_slot(
     lua: HooksLua,
     id: PlayerId,
@@ -533,6 +628,8 @@ fn on_player_try_change_slot(
     res
 }
 
+/// Common handling for a unit that died, by any means. Updates landing,
+/// shot tracking, jtac, and the db. Errors are logged, not returned.
 fn unit_killed(
     lua: MizLua,
     ctx: &mut Context,
@@ -550,10 +647,13 @@ fn unit_killed(
     Ok(())
 }
 
+/// The DCS world event handler, registered in `delayed_init_miz`
 fn on_event(lua: MizLua, ev: Event) -> Result<()> {
     let start_ts = Utc::now();
     let ctx = unsafe { Context::get_mut() };
     let perf = Arc::make_mut(&mut unsafe { Perf::get_mut() }.inner);
+    // don't log mark events without an initiator, they are created by
+    // scripts (e.g. our own markup) and would flood the log
     match &ev {
         Event::MarkAdded(e) | Event::MarkChange(e) | Event::MarkRemoved(e)
             if e.initiator.is_none() =>
@@ -593,6 +693,8 @@ fn on_event(lua: MizLua, ev: Event) -> Result<()> {
                 if let Some(ucid) = ctx.db.player_in_unit(false, &initiator) {
                     if let Some(player) = ctx.db.player(&ucid) {
                         if let Some((_, Some(inst))) = player.current_slot.as_ref() {
+                            // leaving a unit that isn't parked at an
+                            // objective counts as dying for kill credit
                             if inst.landed_at_objective.is_none() {
                                 ctx.shots_out.dead(initiator.clone(), start_ts)
                             }
@@ -666,6 +768,8 @@ fn on_event(lua: MizLua, ev: Event) -> Result<()> {
         Event::Takeoff(e) | Event::PostponedTakeoff(e) => {
             if let Ok(unit) = e.initiator.as_unit() {
                 let id = unit.object_id()?;
+                // only a real takeoff, not a spawn, a duplicate event, or a
+                // touch and go (landed but its life wasn't returned yet)
                 if !ctx.recently_born.contains_key(&id)
                     && ctx.airborne.insert(id.clone())
                     && ctx.recently_landed.remove(&id).is_none()
@@ -702,6 +806,8 @@ fn on_event(lua: MizLua, ev: Event) -> Result<()> {
                 }
             }
         }
+        // a player added a mark, rebuild their action menu so it can be
+        // used as a target
         Event::MarkAdded(MarkPanel { initiator: Some(unit), .. }) => {
             let oid = unit.object_id()?;
             if let Some(slot) = ctx.db.ephemeral.get_slot_by_object_id(&oid) {
@@ -718,6 +824,7 @@ fn on_event(lua: MizLua, ev: Event) -> Result<()> {
                 }
             }
         }
+        // discard all state so a following mission starts fresh
         Event::MissionEnd => unsafe {
             Context::reset();
             Perf::reset();
@@ -730,6 +837,8 @@ fn on_event(lua: MizLua, ev: Event) -> Result<()> {
     Ok(())
 }
 
+/// Describe a player's remaining lives, one line per life type, or only
+/// `typfilter` if given. Resets the player's lives first if they are due.
 fn lives(db: &mut Db, ucid: &Ucid, typfilter: Option<LifeType>) -> Result<CompactString> {
     db.maybe_reset_lives(ucid, Utc::now())?;
     let player = db.player(ucid).ok_or_else(|| anyhow!("no such player {:?}", ucid))?;
@@ -756,6 +865,9 @@ fn lives(db: &mut Db, ucid: &Ucid, typfilter: Option<LifeType>) -> Result<Compac
     Ok(msg)
 }
 
+/// Show `msg` followed by the player's remaining lives on the screen of the
+/// player in `slot` for 10 seconds. Fails if the slot isn't a unit or is
+/// empty.
 fn message_life(
     ctx: &mut Context,
     slot: &SlotId,
@@ -777,6 +889,11 @@ fn message_life(
     Ok(())
 }
 
+/// Process landings for units that have been on the ground for at least
+/// 10 seconds as of `ts`, returning lives where the db allows it. Units
+/// that don't get a life back stay in `recently_landed` and are checked
+/// again later, units that can no longer be found are dropped. Passing
+/// `DateTime::MAX_UTC` processes every landed unit, as at shutdown.
 fn return_lives(lua: MizLua, ctx: &mut Context, ts: DateTime<Utc>) {
     macro_rules! or_false {
         ($e:expr) => {
@@ -807,6 +924,8 @@ fn return_lives(lua: MizLua, ctx: &mut Context, ts: DateTime<Utc>) {
     }
 }
 
+/// Announce to everyone when an objective has been capturable for 10
+/// consecutive calls (about 10 seconds)
 fn advise_captureable(ctx: &mut Context) -> Result<()> {
     let cur_cap = ctx.db.capturable_objectives();
     for oid in &cur_cap {
@@ -822,6 +941,7 @@ fn advise_captureable(ctx: &mut Context) -> Result<()> {
     Ok(())
 }
 
+/// Process objective captures and tell both sides about them
 fn advise_captured(ctx: &mut Context, lua: MizLua, ts: DateTime<Utc>) -> Result<()> {
     for (side, oid) in ctx.db.check_capture(lua, ts)? {
         let name = ctx.db.objective(&oid)?.name();
@@ -834,6 +954,8 @@ fn advise_captured(ctx: &mut Context, lua: MizLua, ts: DateTime<Utc>) -> Result<
     Ok(())
 }
 
+/// Send each player in a unit an on screen BRAA report of the bandits the
+/// EWR network can see, if there are any
 fn generate_ewr_reports(ctx: &mut Context, now: DateTime<Utc>) -> Result<()> {
     use std::fmt::Write;
     let mut msgs: SmallVec<[(UnitId, CompactString); 64]> = smallvec![];
@@ -867,6 +989,9 @@ fn generate_ewr_reports(ctx: &mut Context, now: DateTime<Utc>) -> Result<()> {
     Ok(())
 }
 
+/// Show the restart countdown warnings, and shut down when the scheduled
+/// restart time arrives or a side has won the campaign (which also resets
+/// the state)
 fn check_auto_shutdown(
     ctx: &mut Context,
     lua: MizLua,
@@ -915,6 +1040,8 @@ fn check_auto_shutdown(
     Ok(AdminResult::Continue)
 }
 
+/// Move every player whose force-to-spectators time has arrived to
+/// spectators. If the move can't be confirmed it is queued again.
 fn force_players_to_spectators(ctx: &mut Context, net: &Net, ts: DateTime<Utc>) {
     for (_, ids) in ctx.db.ephemeral.players_to_force_to_spectators(ts) {
         for ucid in ids {
@@ -941,6 +1068,10 @@ fn force_players_to_spectators(ctx: &mut Context, net: &Net, ts: DateTime<Utc>) 
     }
 }
 
+/// Update jtac contacts, then rebuild the jtac menu of every slot that is
+/// subscribed to an objective whose contacts changed. Changed objectives
+/// are unsubscribed unless a pinned jtac is there, dead pinned jtacs are
+/// unpinned, and slots with no remaining subscriptions are dropped.
 fn update_jtac_contacts(ctx: &mut Context, lua: MizLua) {
     match ctx.jtac.update_contacts(lua, &mut ctx.landcache, &mut ctx.db) {
         Err(e) => error!("could not update jtac contacts {e}"),
@@ -1002,6 +1133,8 @@ fn update_jtac_contacts(ctx: &mut Context, lua: MizLua) {
     }
 }
 
+/// Give every connected player the configured periodic point award once
+/// per period (seconds), if points are enabled
 fn award_periodic_points(ctx: &mut Context, ts: DateTime<Utc>) {
     if let Some(points) = ctx.db.ephemeral.cfg.points.as_ref() {
         let (award, period) = points.periodic_point_gain;
@@ -1017,6 +1150,11 @@ fn award_periodic_points(ctx: &mut Context, ts: DateTime<Utc>) {
     }
 }
 
+/// The expensive periodic work, run at most once every
+/// `slow_timed_events_freq` seconds: auto shutdown, warehouse sync, life
+/// returns, kill reporting, repairs, actions, EWR, objective culling and
+/// threat warnings, markup, jtac contacts, state snapshots, and periodic
+/// points. Returns `Shutdown` if the server should exit.
 fn run_slow_timed_events(
     lua: MizLua,
     ctx: &mut Context,
@@ -1042,6 +1180,7 @@ fn run_slow_timed_events(
             }
         }
         return_lives(lua, ctx, ts);
+        // a unit is only considered recently born for about 5 seconds
         ctx.recently_born.retain(|_, ts| start_ts - *ts <= Duration::seconds(5));
         {
             // report kills
@@ -1106,6 +1245,7 @@ fn run_slow_timed_events(
         update_jtac_contacts(ctx, lua);
         record_perf(&mut perf.update_jtac_contacts, ts);
         let now = Utc::now();
+        // the state is written to disk in the background
         if let Some(snap) = ctx.db.maybe_snapshot() {
             ctx.do_bg_task(bg::Task::SaveState(path.clone(), snap));
         }
@@ -1116,6 +1256,10 @@ fn run_slow_timed_events(
     Ok(AdminResult::Continue)
 }
 
+/// One tick of the main loop, run about once per second. `path` is the
+/// saved state path. Errors from the individual steps are logged and the
+/// rest of the tick still runs. Returns `Shutdown` if the server should
+/// exit.
 fn run_timed_events(
     ctx: &mut Context,
     lua: MizLua,
@@ -1157,6 +1301,7 @@ fn run_timed_events(
         Ok(AdminResult::Shutdown) => return Ok(AdminResult::Shutdown),
         Err(e) => error!("error running slow timed events {:?}", e),
     }
+    // build at most one slot's menus per tick to spread out the cost
     if let Some(slot) = ctx.menu_init_queue.shift_remove_index(0) {
         if let Err(e) = menu::init_for_slot(ctx, lua, &slot) {
             error!("could not init menus for slot {:?} {:?}", slot, e)
@@ -1197,6 +1342,7 @@ fn run_timed_events(
     }
     record_perf(&mut perf.jtac_target_positions, now);
     let now = Utc::now();
+    // this runs once per second, so max_rate per tick is a per second rate
     let max_rate = ctx.db.ephemeral.cfg.max_msgs_per_second;
     ctx.db.ephemeral.msgs().process(max_rate, &net, &act);
     record_perf(&mut perf.process_messages, now);
@@ -1220,6 +1366,10 @@ fn run_timed_events(
     Ok(AdminResult::Continue)
 }
 
+/// Schedule `run_timed_events` to run every second of mission time. Panics
+/// in a tick are caught and logged so they don't stop the loop. When a
+/// tick returns `Shutdown` the event handler is removed, the timer stops,
+/// and the DCS process is told to exit.
 fn start_timed_events(ctx: &mut Context, lua: MizLua, path: PathBuf) -> Result<()> {
     ctx.last_slow_timed_events = Utc::now();
     let timer = Timer::singleton(lua)?;
@@ -1259,6 +1409,11 @@ fn start_timed_events(ctx: &mut Context, lua: MizLua, path: PathBuf) -> Result<(
     Ok(())
 }
 
+/// Initialize the campaign once the mission has loaded. Indexes the miz,
+/// registers the event handler, loads the config and the saved state from
+/// `<DCS write dir>/<sortie>` (or initializes a new campaign if there is no
+/// saved state), schedules the auto shutdown, respawns all groups, and
+/// starts the timer loop. Fails if the miz has no sortie name.
 fn delayed_init_miz(lua: MizLua) -> Result<()> {
     info!("init_miz: welcome to blue flag v3");
     let ctx = unsafe { Context::get_mut() };
@@ -1319,6 +1474,7 @@ fn delayed_init_miz(lua: MizLua) -> Result<()> {
     Ok(())
 }
 
+/// onMissionLoadEnd hook, starts the `LoadState` countdown
 fn on_mission_load_end(_lua: HooksLua) -> Result<()> {
     unsafe {
         Context::get_mut().load_state = LoadState::MissionLoaded { time: Utc::now() }
@@ -1327,6 +1483,8 @@ fn on_mission_load_end(_lua: HooksLua) -> Result<()> {
     Ok(())
 }
 
+/// onPlayerDisconnect hook, removes the player from the connected set and
+/// their slot
 fn on_player_disconnect(_: HooksLua, id: PlayerId) -> Result<()> {
     info!("onPlayerDisconnect({id})");
     let start_ts = Utc::now();
@@ -1342,6 +1500,9 @@ fn on_player_disconnect(_: HooksLua, id: PlayerId) -> Result<()> {
     Ok(())
 }
 
+/// onSimulationFrame hook. Records the wall clock time between frames in
+/// nanoseconds in the frame time histogram, ignoring gaps over 1 second
+/// (e.g. pauses).
 fn on_simulation_frame(_: HooksLua) -> Result<()> {
     let frame = Arc::make_mut(&mut unsafe { Perf::get_mut() }.frame);
     let now = Utc::now();
@@ -1362,6 +1523,8 @@ fn on_simulation_frame(_: HooksLua) -> Result<()> {
     Ok(())
 }
 
+/// Called by the server hooks environment via `initHooks`, registers our
+/// user hooks
 fn init_hooks(lua: HooksLua) -> Result<()> {
     info!("setting user hooks");
     UserHooks::new(lua)
@@ -1375,6 +1538,10 @@ fn init_hooks(lua: HooksLua) -> Result<()> {
     Ok(())
 }
 
+/// Called by the mission scripting environment via `initMiz`. Polls every
+/// second until `LoadState::init_ok`, then runs `delayed_init_miz`. If that
+/// fails the error is shown on everyone's screen every 10 seconds, and
+/// players are still let in so they can see it.
 fn init_miz(lua: MizLua) -> Result<()> {
     info!("initializing mission");
     let timer = Timer::singleton(lua)?;
@@ -1413,6 +1580,9 @@ fn init_miz(lua: MizLua) -> Result<()> {
     Ok(())
 }
 
+/// The DLL entry point, run by `require("bflib")`. Starts the background
+/// thread and returns the module table containing `initHooks` and
+/// `initMiz`.
 #[mlua::lua_module]
 fn bflib(lua: &Lua) -> LuaResult<LuaTable<'_>> {
     // ensure we capture backtraces on panic

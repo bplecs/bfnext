@@ -14,6 +14,14 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! The F10 "Cargo" radio menu for cargo capable aircraft.
+//!
+//! Each command is a thin wrapper that resolves the calling group to its slot, calls the
+//! corresponding operation in [`crate::db::cargo`], and reports the result to the group
+//! (or, for successful unpacks, to the whole side). [`add_cargo_menu_for_group`] builds the
+//! menu, including a "Crates" submenu for spawning every crate the side can use, organized
+//! by each deployable's menu path.
+
 use super::{ArgTuple, player_name, slot_for_group};
 use crate::{
     Context,
@@ -32,6 +40,8 @@ use dcso3::{
 use fxhash::FxHashMap;
 use std::collections::hash_map::Entry;
 
+/// "Unpack Nearby Crate(s)": success is announced to the player's side, failure reasons
+/// are sent to the group.
 fn unpakistan(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (side, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -49,6 +59,8 @@ fn unpakistan(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// "Load Nearby Crate": on success also tells the player how many of the crate's deployable
+/// are already deployed and what will happen when the limit is reached.
 fn load_crate(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (side, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -57,6 +69,7 @@ fn load_crate(lua: MizLua, gid: GroupId) -> Result<()> {
             let (dep_name, limit_enforce, limit) = match ctx.db.deployable_by_crate(&side, &cr.name)
             {
                 Some((dep_name, dep)) => (dep_name, &dep.limit_enforce, Some(dep.limit)),
+                // not a deployable crate (e.g. a logistics crate), report it as unlimited
                 None => (&cr.name, &LimitEnforceTyp::DenyCrate, None),
             };
             let (n, oldest) = ctx
@@ -121,6 +134,9 @@ fn unload_crate(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// Send the unit in `slot` a summary of its cargo: slots used vs capacity, each crate and
+/// troop onboard, and the total weight in kg. Errors if the slot is unknown or the aircraft
+/// can't carry cargo.
 pub(crate) fn list_cargo_for_slot(ctx: &mut Context, slot: &SlotId) -> Result<()> {
     let cargo = Cargo::default();
     let cargo = ctx.db.list_cargo(&slot).unwrap_or(&cargo);
@@ -178,12 +194,15 @@ pub(crate) fn list_cargo_for_slot(ctx: &mut Context, slot: &SlotId) -> Result<()
     Ok(())
 }
 
+/// "List Cargo", see [`list_cargo_for_slot`].
 pub fn list_current_cargo(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (_side, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
     list_cargo_for_slot(ctx, &slot)
 }
 
+/// "List Nearby Crates": name, bearing (degrees), and distance (meters) of each crate in
+/// loading range, closest first.
 fn list_nearby_crates(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (_side, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -204,6 +223,7 @@ fn list_nearby_crates(lua: MizLua, gid: GroupId) -> Result<()> {
         }
         ctx.db.ephemeral.msgs().panel_to_group(10, false, gid, msg)
     } else {
+        // nearby borrows ctx.db, release it before sending the message
         drop(nearby);
         ctx.db
             .ephemeral
@@ -213,6 +233,7 @@ fn list_nearby_crates(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// "Destroy Nearby Crate": silent on success, errors are sent to the group.
 fn destroy_nearby_crate(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (_side, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -225,6 +246,8 @@ fn destroy_nearby_crate(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// Spawn the crate named `arg.snd` for group `arg.fst`. If a per player crate limit is
+/// configured, reports how many crates the player has out and which will be deleted next.
 fn spawn_crate(lua: MizLua, arg: ArgTuple<GroupId, String>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (_side, slot) = slot_for_group(lua, ctx, &arg.fst).context("getting slot for group")?;
@@ -257,6 +280,10 @@ fn spawn_crate(lua: MizLua, arg: ArgTuple<GroupId, String>) -> Result<()> {
     Ok(())
 }
 
+/// Build the "Cargo" F10 menu for `group`, containing the cargo commands and a "Crates"
+/// submenu. "Crates" holds a "Logistics" submenu (the repair crate, and the supply transfer
+/// crate if warehouses are enabled) and every deployable crate, nested by the deployable's
+/// menu path.
 pub(super) fn add_cargo_menu_for_group(
     cfg: &Cfg,
     mc: &MissionCommands,
@@ -332,6 +359,8 @@ pub(super) fn add_cargo_menu_for_group(
             },
         )?;
     }
+    // submenus already created, keyed by path component name so deployables sharing a
+    // path prefix share submenus
     let mut created_menus: FxHashMap<String, GroupSubMenu> = FxHashMap::default();
     for dep in cfg.deployables.get(side).unwrap_or(&vec![]) {
         if dep.crates.is_empty() && dep.repair_crate.is_none() {
@@ -346,6 +375,7 @@ pub(super) fn add_cargo_menu_for_group(
                 match created_menus.entry(p.clone()) {
                     Entry::Occupied(e) => Ok(e.get().clone()),
                     Entry::Vacant(e) => {
+                        // the leaf submenu (the deployable itself) shows its cost
                         let item = if p == name && dep.cost > 0 {
                             String::from(format_compact!("{p}({} pts)", dep.cost))
                         } else {

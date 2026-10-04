@@ -14,6 +14,20 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Crate and troop logistics.
+//!
+//! Transport aircraft (mostly helicopters) move crates and troops around the map:
+//! - crates are spawned at friendly logistics objectives ([`Db::spawn_crate`]), loaded,
+//!   carried, and unloaded as internal cargo, then unpacked ([`Db::unpakistan`]) into a
+//!   deployable group or FARP, used to repair a damaged deployable, repair an objective's
+//!   logistics, or transfer warehouse supplies between objectives.
+//! - troops are loaded at friendly logistics, unloaded anywhere on the ground, extracted
+//!   again from the field, or returned to logistics for a refund.
+//!
+//! Crates on the ground are real (persisted) groups with [`DeployKind::Crate`] origin.
+//! Cargo onboard an aircraft is tracked per slot in `ephemeral.cargo`, and its weight is
+//! applied to the aircraft via DCS's internal cargo trigger action.
+
 use super::{Db, ephemeral::DeployableIndex, group::SpawnedGroup, objective::Objective};
 use crate::{
     db::group::DeployKind,
@@ -48,25 +62,39 @@ use serde_derive::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
 use std::{cmp::max, fmt, sync::Arc};
 
+/// A crate on the ground near some reference point.
 #[derive(Debug, Clone, Copy)]
 pub struct NearbyCrate<'a> {
+    /// the crate's group
     pub group: &'a SpawnedGroup,
+    /// the objective the crate was spawned at
     pub origin: ObjectiveId,
     pub crate_def: &'a Crate,
     pub pos: Vector2,
+    /// bearing from the reference point to the crate in degrees
     pub heading: f64,
+    /// distance from the reference point to the crate in meters
     pub distance: f64,
 }
 
+/// The successful outcome of [`Db::unpakistan`]. Its `Display` impl is the message
+/// broadcast to the player's side.
 #[derive(Debug, Clone)]
 pub enum Unpakistan {
+    /// unpacked the named deployable group
     Unpacked(String),
+    /// unpacked a FARP objective with the given name
     UnpackedFarp(String),
+    /// repaired the named deployable
     Repaired(String),
+    /// repaired logistics at the named objective, which is now at the given logi percent
     RepairedBase(String, u8),
+    /// transferred warehouse supplies (from, to)
     TransferedSupplies(String, String),
 }
 
+/// The oldest instance of a deployable, which is either a group or (for FARPs) an objective.
+/// Used to enforce [`LimitEnforceTyp::DeleteOldest`].
 #[derive(Debug, Clone, Copy)]
 pub enum Oldest {
     Group(GroupId),
@@ -90,17 +118,25 @@ impl fmt::Display for Unpakistan {
     }
 }
 
+/// A troop squad carried as internal cargo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InternalTroop {
+    /// the player who owns (paid for) the troop
     pub player: Ucid,
+    /// the objective the troop was loaded at and charged against, if any
     pub origin: Option<ObjectiveId>,
+    /// fraction of the cost paid by the player rather than the objective, see
+    /// [`Db::charge_for_item`]. Used to split refunds.
     pub cost_fraction: f32,
     pub troop: Troop,
 }
 
+/// Everything onboard one aircraft.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Cargo {
+    /// troops onboard, the last one is unloaded first
     pub troops: SmallVec<[InternalTroop; 2]>,
+    /// crates onboard with their origin objective, the last one is unloaded first
     pub crates: SmallVec<[(ObjectiveId, Crate); 1]>,
 }
 
@@ -117,6 +153,7 @@ impl Cargo {
         self.num_crates() + self.num_troops()
     }
 
+    /// Total weight of all crates and troops onboard in kg.
     pub fn weight(&self) -> i64 {
         let cr = self
             .crates
@@ -128,19 +165,27 @@ impl Cargo {
     }
 }
 
+/// A snapshot of the state of the aircraft in a slot, used by the cargo operations.
 #[derive(Debug, Clone)]
 pub struct SlotStats {
+    /// the DCS unit name
     pub name: String,
     pub side: Side,
+    /// altitude above ground level in meters
     pub agl: f64,
+    /// ground speed in km/h
     pub speed: f64,
     pub in_air: bool,
     pub pos: Position3,
+    /// 2d position (DCS x, z)
     pub point: Vector2,
+    /// the player in the slot
     pub ucid: Ucid,
 }
 
 impl SlotStats {
+    /// Query DCS for the current state of the unit in `slot`. Errors if no player is in the
+    /// slot, the player isn't registered, or the unit isn't currently in the mission.
     pub fn get(db: &Db, lua: MizLua, slot: &SlotId) -> Result<Self> {
         let ucid = maybe!(db.ephemeral.players_by_slot, *slot, "no such player")?.clone();
         let side = maybe!(db.persisted.players, ucid, "no player for ucid")?.side;
@@ -151,6 +196,7 @@ impl SlotStats {
         let point = Vector2::new(pos.p.x, pos.p.z);
         let ground_alt = Land::singleton(lua)?.get_height(LuaVec2(point))?;
         let agl = pos.p.y - ground_alt;
+        // m/s -> km/h
         let speed = unit.get_velocity()?.0.magnitude() * 3600. / 1000.;
         Ok(Self {
             name,
@@ -166,6 +212,8 @@ impl SlotStats {
 }
 
 impl Db {
+    /// Find a `side` owned objective with working logistics (logi > 0) whose zone contains
+    /// `point`. Errors if there is none.
     fn point_near_logistics(
         &self,
         side: Side,
@@ -187,6 +235,13 @@ impl Db {
         }
     }
 
+    /// Spawn the crate called `name` in front of the landed aircraft in `slot`.
+    ///
+    /// The aircraft must be on the ground inside a friendly objective with logistics, and
+    /// there must be no other crate near the spawn point. If the player is at the configured
+    /// `max_crates` limit their oldest crate is deleted. The player is warned (but not
+    /// prevented) if they can't afford the deployable the crate builds. Returns the slot
+    /// stats used, so the caller can report on the player's crate count.
     pub fn spawn_crate(
         &mut self,
         lua: MizLua,
@@ -199,6 +254,7 @@ impl Db {
         if st.in_air {
             bail!("you must land to spawn crates")
         }
+        // the aircraft's forward vector projected onto the ground plane
         let dir = Vector2::new(st.pos.x.x, st.pos.x.z);
         let approx_spawn_pos = st.point + dir * 20.;
         if !self
@@ -212,6 +268,7 @@ impl Db {
             if crates.len() < max_crates as usize {
                 None
             } else {
+                // group ids are allocated sequentially, so the smallest is the oldest
                 crates.into_iter().next().map(|id| *id)
             }
         });
@@ -277,6 +334,7 @@ impl Db {
         Ok(st)
     }
 
+    /// List all crates (of any side) within `max_dist` meters of `point`, closest first.
     fn list_crates_near_point<'a>(
         &'a self,
         point: Vector2,
@@ -319,6 +377,7 @@ impl Db {
         Ok(res)
     }
 
+    /// List all crates within `crate_load_distance` of the aircraft, closest first.
     pub fn list_nearby_crates<'a>(
         &'a self,
         st: &SlotStats,
@@ -327,6 +386,7 @@ impl Db {
         self.list_crates_near_point(st.point, max_dist)
     }
 
+    /// Delete the crate closest to the landed aircraft in `slot` (any side, any owner).
     pub fn destroy_nearby_crate(&mut self, lua: MizLua, slot: &SlotId) -> Result<()> {
         let st = SlotStats::get(self, lua, slot)?;
         if st.in_air {
@@ -350,6 +410,7 @@ impl Db {
         self.persisted.deployed.contains(gid)
     }
 
+    /// The cargo capacity of `vehicle`. Errors if the vehicle can't carry cargo.
     pub fn cargo_capacity(&self, vehicle: &Vehicle) -> Result<CargoConfig> {
         let cargo_capacity = self
             .ephemeral
@@ -361,6 +422,9 @@ impl Db {
         Ok(cargo_capacity)
     }
 
+    /// Count the instances of the deployable `name` (the last element of its menu path)
+    /// that `side` currently has, including FARP objectives. Also returns the first
+    /// (lowest id, i.e. oldest) instance found, groups taking precedence over FARPs.
     pub fn number_deployed(&self, side: Side, name: &str) -> Result<(usize, Option<Oldest>)> {
         let mut n = 0;
         let mut oldest = None;
@@ -398,6 +462,7 @@ impl Db {
         Ok((n, oldest))
     }
 
+    /// Find the deployable built from the crate called `name`, returning its name and spec.
     pub fn deployable_by_crate<'a>(
         &'a self,
         side: &Side,
@@ -410,6 +475,8 @@ impl Db {
         })
     }
 
+    /// Count the deployed troop groups of type `name` belonging to `side`, and return the
+    /// oldest one.
     pub fn number_troops_deployed(
         &self,
         side: Side,
@@ -431,6 +498,7 @@ impl Db {
         Ok((n, oldest))
     }
 
+    /// Count the crates on the ground owned by the player in `st`, and return the oldest.
     pub fn number_crates_deployed(&self, st: &SlotStats) -> Result<(usize, Option<GroupId>)> {
         let player = maybe!(self.persisted.players, &st.ucid, "no such player")?;
         let n = player.crates.len();
@@ -438,7 +506,20 @@ impl Db {
         Ok((n, oldest))
     }
 
+    /// Do something useful with the crates near the landed aircraft in `slot`.
+    ///
+    /// The candidate crates are those within `crate_load_distance` of the aircraft, plus any
+    /// crates within `crate_spread` of those. The following are tried in order, and the
+    /// first that succeeds is returned:
+    /// 1. repair the logistics of a friendly objective with a base repair crate
+    /// 2. transfer warehouse supplies with a supply transfer crate
+    /// 3. unpack a deployable group or FARP, if all its required crates are present
+    /// 4. repair a damaged deployable near its repair crates
+    ///
+    /// Points are charged or awarded as configured. If nothing could be done, the error
+    /// message lists the reasons each option failed.
     pub fn unpakistan(&mut self, lua: MizLua, idx: &MizIndex, slot: &SlotId) -> Result<Unpakistan> {
+        /// owned copy of the parts of a `NearbyCrate` we need, so `self` can be mutated
         #[derive(Clone)]
         struct Cifo {
             pos: Vector2,
@@ -456,6 +537,8 @@ impl Db {
                 }
             }
         }
+        /// crates near the player, extended by every crate within `crate_spread` of one of
+        /// them, deduplicated by group
         fn nearby(db: &Db, st: &SlotStats) -> Result<SmallVec<[Cifo; 8]>> {
             let nearby_player = db
                 .list_nearby_crates(st)?
@@ -479,6 +562,9 @@ impl Db {
                 Ok(crates.into_iter().map(|(_, cr)| cr).collect())
             }
         }
+        /// group the nearby crates by the deployable they build (deployable -> crate name
+        /// -> crates), keeping only deployables for which every required crate is present,
+        /// trimmed to exactly the required number. Errors with the reasons if none qualify.
         fn buildable(
             nearby: &SmallVec<[Cifo; 8]>,
             didx: &DeployableIndex,
@@ -523,6 +609,7 @@ impl Db {
                 Ok(candidates)
             }
         }
+        /// the nearby objective logistics repair crates for `side`
         fn base_repairable(
             db: &Db,
             side: Side,
@@ -535,6 +622,7 @@ impl Db {
                 .map(|ci| (ci.group, ci.clone()))
                 .collect()
         }
+        /// the nearby supply transfer crates for `side` (none if warehouses are disabled)
         fn supply_transferrable(
             db: &Db,
             side: Side,
@@ -551,6 +639,10 @@ impl Db {
                 smallvec![]
             }
         }
+        /// for each nearby deployable repair crate find a deployed group of the matching
+        /// deployable with a unit within `max_dist` meters of the crate. Keeps only repairs
+        /// with enough crates (trimmed to exactly the required number), keyed by deployable
+        /// name. Errors with the reasons if none qualify.
         fn repairable(
             db: &Db,
             nearby: &SmallVec<[Cifo; 8]>,
@@ -614,6 +706,10 @@ impl Db {
                 Ok(repairs)
             }
         }
+        /// true if `centroid` is within `logistics_exclusion` meters of (or inside 1.1x the
+        /// zone of) an objective that blocks unpacking. When `logistics` is true (unpacking
+        /// an objective, e.g. a FARP) every objective blocks. Otherwise only threatened
+        /// objectives that are friendly or are the origin of one of the crates block.
         fn too_close<'a, I: Iterator<Item = &'a Cifo>, F: Fn() -> I>(
             db: &Db,
             side: Side,
@@ -634,6 +730,9 @@ impl Db {
                 }
             })
         }
+        /// find a `side` owned objective whose zone contains `centroid` and which is not the
+        /// origin of any of the crates, i.e. the crates must be carried to a different
+        /// objective than the one they were spawned at
         fn close_enough_to_repair<'a, I: Iterator<Item = &'a Cifo>, F: Fn() -> I>(
             db: &Db,
             side: Side,
@@ -652,6 +751,9 @@ impl Db {
                 }
             })
         }
+        /// compute where to spawn the deployable. Crates with a `pos_unit` place units of
+        /// that type at the average position of those crates, everything else spawns
+        /// around `centroid`.
         fn compute_positions(
             db: &mut Db,
             have: &FxHashMap<String, Vec<Cifo>>,
@@ -694,6 +796,9 @@ impl Db {
             };
             Ok(spawnloc)
         }
+        /// check that the player plus the `origin` objective can afford `spec`, and that the
+        /// side's deploy limit isn't exceeded, deleting the oldest instance if the limit is
+        /// enforced that way. Returns `origin` on success.
         fn enforce_deploy_limits(
             db: &mut Db,
             side: Side,
@@ -705,6 +810,7 @@ impl Db {
             if let Some(player) = db.persisted.players.get(ucid)
                 && let Some(obj) = db.persisted.objectives.get(&origin)
             {
+                // a negative player balance doesn't reduce what the objective can cover
                 let player_points = max(0, player.points);
                 if spec.cost as i32 > player_points + obj.points {
                     bail!(
@@ -744,6 +850,7 @@ impl Db {
         if nearby.is_empty() {
             bail!("no nearby crates")
         }
+        // reasons each option failed, reported if nothing succeeds
         let mut reasons: SmallVec<[CompactString; 2]> = smallvec![];
         let base_repairs = base_repairable(self, st.side, &nearby);
         let supply_transfer = supply_transferrable(self, st.side, &nearby);
@@ -757,6 +864,7 @@ impl Db {
                 if obj.logi == 100 {
                     reasons.push("objective logistics are completely repaired".into());
                 } else {
+                    // one crate repairs one step
                     self.repair_one_logi_step(st.side, Utc::now(), oid)?;
                     self.delete_group(base_repairs.keys().next().unwrap())?;
                     self.ephemeral.stat(Stat::Repair {
@@ -820,6 +928,7 @@ impl Db {
         match buildable(&nearby, &didx) {
             Err(mut build_reasons) => reasons.append(&mut build_reasons),
             Ok(mut candidates) => {
+                // if several deployables could be built, an arbitrary one is chosen
                 let (dep, have) = candidates.drain().next().unwrap();
                 let spec = maybe!(didx.deployables_by_name, dep, "deployable")?.clone();
                 let centroid = centroid2d(have.values().flat_map(|c| c.iter()).map(|c| c.pos));
@@ -845,6 +954,8 @@ impl Db {
                         oids.dedup();
                         oids
                     };
+                    // try each distinct crate origin until one passes the cost and limit
+                    // checks, that objective is then charged for the deployable
                     let can_deploy = origins.iter().fold(Err(anyhow!("")), |res, oid| match res {
                         Ok(oid) => Ok(oid),
                         Err(_) => enforce_deploy_limits(self, st.side, &spec, &dep, *oid, &st.ucid),
@@ -935,6 +1046,7 @@ impl Db {
                 } else if too_close(self, st.side, centroid, false, || have.iter()) {
                     reasons.push("can't repair that here while enemies are close".into())
                 } else {
+                    // revive every unit in the group and respawn it
                     let group = group!(self, gid)?;
                     for uid in &group.units {
                         let unit = unit_mut!(self, uid)?;
@@ -971,6 +1083,10 @@ impl Db {
         )
     }
 
+    /// Unload the most recently loaded crate from the aircraft in `slot` and spawn it on the
+    /// ground just in front of the aircraft. The crate may be dropped in flight if the aircraft
+    /// is at or below the crate's max drop speed and height. On failure the crate stays
+    /// onboard.
     pub fn unload_crate(&mut self, lua: MizLua, idx: &MizIndex, slot: &SlotId) -> Result<Crate> {
         let st = SlotStats::get(self, lua, slot)?;
         let cargo = self.ephemeral.cargo.get(slot);
@@ -980,6 +1096,7 @@ impl Db {
         let cargo = self.ephemeral.cargo.get_mut(slot).unwrap();
         let (oid, crate_cfg) = cargo.crates.pop().unwrap();
         let weight = cargo.weight();
+        // on any failure below the crate is pushed back onboard
         if st.in_air && st.speed > crate_cfg.max_drop_speed as f64 {
             let max_sp = (crate_cfg.max_drop_speed * 3600) / 1000;
             let max_al = crate_cfg.max_drop_height_agl;
@@ -1042,6 +1159,8 @@ impl Db {
         Ok(crate_cfg)
     }
 
+    /// Look up the cargo capacity, side, and DCS unit name of `slot`. Errors if the slot is
+    /// unknown or its aircraft can't carry cargo.
     pub fn unit_cargo_cfg(&self, slot: &SlotId) -> Result<(CargoConfig, Side, String)> {
         let si = self
             .ephemeral
@@ -1053,6 +1172,9 @@ impl Db {
         Ok((cargo_capacity, side, unit_name))
     }
 
+    /// Load the closest friendly crate within `crate_load_distance` into the aircraft in
+    /// `slot`, removing it from the ground. Note that the aircraft need not be landed.
+    /// Errors if the aircraft is full or there is no crate in range.
     pub fn load_nearby_crate(&mut self, lua: MizLua, slot: &SlotId) -> Result<Crate> {
         let st = SlotStats::get(self, lua, slot)?;
         let (cargo_capacity, side, unit_name) = self.unit_cargo_cfg(slot)?;
@@ -1087,6 +1209,10 @@ impl Db {
         Ok(crate_def)
     }
 
+    /// Load the troop squad `name` into the aircraft in `slot`. The aircraft must be inside
+    /// a friendly objective with logistics, which becomes the troop's origin. The troop's
+    /// cost is charged to the player (and the objective for any shortfall) at load time.
+    /// Returns the troop config and the origin objective.
     pub fn load_troops(
         &mut self,
         lua: MizLua,
@@ -1148,6 +1274,11 @@ impl Db {
         Ok((troop_cfg, origin))
     }
 
+    /// Unload the most recently loaded troop from the landed aircraft in `slot` and spawn it
+    /// as a group just in front of the aircraft. Troops can't be unloaded inside friendly
+    /// logistics that are threatened. Enforces the troop's deploy limit. Returns the troop,
+    /// the new group, and the objective nearest the drop point (of any side). On spawn
+    /// failure the troop stays onboard.
     pub fn unload_troops(
         &mut self,
         lua: MizLua,
@@ -1244,6 +1375,10 @@ impl Db {
         }
     }
 
+    /// Return the most recently loaded troop in the landed aircraft in `slot` to friendly
+    /// logistics, refunding its cost. The refund is split between the player and the
+    /// troop's origin objective according to its cost fraction, or goes entirely to the
+    /// player if the troop has no origin.
     pub fn return_troops(&mut self, lua: MizLua, slot: &SlotId) -> Result<Troop> {
         let cargo = self.ephemeral.cargo.get(slot);
         if cargo.map(|c| c.troops.is_empty()).unwrap_or(true) {
@@ -1284,6 +1419,10 @@ impl Db {
         Ok(it.troop)
     }
 
+    /// Pick up a friendly deployed troop group with any unit within `crate_load_distance` of
+    /// the aircraft in `slot`, deleting the group and putting the troop onboard. The troop
+    /// keeps its original owner, origin, and cost fraction. Note that the aircraft need not
+    /// be landed.
     pub fn extract_troops(&mut self, lua: MizLua, slot: &SlotId) -> Result<Troop> {
         let (cargo_capacity, side, unit_name) = self.unit_cargo_cfg(slot)?;
         let pos = self.ephemeral.slot_instance_pos(lua, slot)?;

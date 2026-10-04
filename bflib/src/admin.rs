@@ -14,6 +14,21 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Server admin commands.
+//!
+//! Admins (players whose ucid is in the config's `admins` list) type
+//! `-admin <command>` in chat. The chat hook parses the command with
+//! [`AdminCommand::from_str`] and queues it on the [`Context`]. External
+//! clients can also submit commands over netidx rpc, which arrive on
+//! `Context::external_admin_commands`. Both queues are drained once per
+//! timer tick by [`run_admin_commands`], which runs in the mission
+//! scripting environment ([`MizLua`]) since most commands need it.
+//!
+//! Commands cover logistics (reduce, transfer, tick, deliver, repair),
+//! spawning and explosions at F10 marks, player management (ban, kick,
+//! side switch, lives, points, admins), debugging (log-warehouse,
+//! log-desc, remark), and shutting down or resetting the campaign.
+
 use crate::{
     Context,
     bg::Task,
@@ -59,9 +74,12 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+/// Which warehouse the `log-warehouse` command should dump
 #[derive(Debug, Clone, Copy)]
 pub enum WarehouseKind {
+    /// the campaign's own inventory for the objective
     Objective,
+    /// the DCS airbase warehouse
     DCS,
 }
 
@@ -77,17 +95,23 @@ impl FromStr for WarehouseKind {
     }
 }
 
+/// Returned by `run_admin_commands` to tell the main loop whether a
+/// command has shut the server down
 #[derive(Debug, Clone, Copy)]
 pub enum AdminResult {
     Shutdown,
     Continue,
 }
 
+/// A parsed admin command. Commands arrive either from an admin in
+/// chat or from an external client over netidx, see `Caller`. Each
+/// variant corresponds to an entry in `AdminCommand::help`.
 #[derive(Debug, Clone)]
 pub enum AdminCommand {
     Help,
     ReduceInventory {
         airbase: String,
+        /// percent to reduce by, 0 - 100
         amount: u8,
     },
     TransferSupply {
@@ -99,9 +123,12 @@ pub enum AdminCommand {
     Repair {
         airbase: String,
     },
+    /// explosions at marks with text `key`
     Tim {
         key: String,
+        /// explosion power passed to `trigger.action.explosion`
         size: usize,
+        /// altitude in meters, overrides the mark's y coordinate
         alt: Option<isize>,
     },
     Spawn {
@@ -113,6 +140,7 @@ pub enum AdminCommand {
     },
     Ban {
         player: String,
+        /// None means forever
         until: Option<DateTime<Utc>>,
     },
     Unban {
@@ -145,6 +173,7 @@ pub enum AdminCommand {
     },
     SetPoints {
         amount: i32,
+        /// a player, or `objective:<name>` to set an objective's points
         player: String,
     },
     Delete {
@@ -156,6 +185,7 @@ pub enum AdminCommand {
     Remark {
         objective: String,
     },
+    /// shut down and delete the saved state, ending the round
     Reset {
         winner: Option<Side>,
     },
@@ -163,6 +193,7 @@ pub enum AdminCommand {
 }
 
 impl AdminCommand {
+    /// One usage line per command, shown by the `help` command
     pub fn help() -> &'static [&'static str] {
         &[
             "reduce <objective> <percent>: reduce supplies at objective by <percent>",
@@ -198,6 +229,9 @@ impl AdminCommand {
 impl FromStr for AdminCommand {
     type Err = anyhow::Error;
 
+    /// Parse a command line, e.g. `ban 10days D4n`. Commands are
+    /// matched by prefix in order, so a command that is a prefix of
+    /// another (`reset` and `reset-lives`) must come after it.
     fn from_str(s: &str) -> Result<Self> {
         if s.trim() == "help" {
             Ok(Self::Help)
@@ -269,6 +303,7 @@ impl FromStr for AdminCommand {
             match s.split_once(" ") {
                 None => bail!("ban <duration|forever> <alias|id|ucid>"),
                 Some((dur, player)) => {
+                    // None means banned forever
                     let until = if dur == "forever" {
                         None
                     } else {
@@ -330,6 +365,7 @@ impl FromStr for AdminCommand {
                 objective: s.into(),
             })
         } else if let Some(s) = s.strip_prefix("reset") {
+            // an optional winning side may follow, e.g. `reset blue`
             let winner = if s == "" {
                 None
             } else {
@@ -342,10 +378,16 @@ impl FromStr for AdminCommand {
     }
 }
 
+/// Spawn a troop or deployable at every F10 mark whose text starts
+/// with `key`, then remove those marks. The rest of the mark text is
+/// `<troop|deployable> <side> <heading> <name>`. Spawned units are
+/// owned by the admin who ran the command, or by nobody (the default
+/// ucid) if it came from an external client.
 fn admin_spawn(ctx: &mut Context, lua: MizLua, id: Option<PlayerId>, key: String) -> Result<()> {
     let mut to_remove: SmallVec<[MarkId; 8]> = smallvec![];
     let act = Trigger::singleton(lua)?.action()?;
     let spctx = SpawnCtx::new(lua)?;
+    // the trailing space ensures key "a" doesn't match a mark starting with "ab"
     let key = format_compact!("{} ", key);
     let ucid = match id {
         None => Ucid::default(),
@@ -379,6 +421,7 @@ fn admin_spawn(ctx: &mut Context, lua: MizLua, id: Option<PlayerId>, key: String
         if mk.text.starts_with(key.as_str()) {
             to_remove.push(mk.id);
             let spec = mk.text.as_str().strip_prefix(key.as_str()).unwrap();
+            // splitn so the name (the last field) may contain spaces
             let mut iter = spec.splitn(4, " ");
             let kind = iter
                 .next()
@@ -452,6 +495,7 @@ fn admin_spawn(ctx: &mut Context, lua: MizLua, id: Option<PlayerId>, key: String
                         .deployables
                         .get(&side)
                         .ok_or_else(|| anyhow!("no deployables on {side}"))?;
+                    // deployables are named by the last element of their menu path
                     let spec = specs
                         .iter()
                         .find(|dp| dp.path.ends_with(&[String::from(name)]))
@@ -495,6 +539,11 @@ fn admin_spawn(ctx: &mut Context, lua: MizLua, id: Option<PlayerId>, key: String
     Ok(())
 }
 
+/// Resolve `key` to a player's ucid. In order, `key` is tried as the
+/// player id of a connected player, as a known ucid, and finally as a
+/// case insensitive regex (or exact string if it isn't a valid regex)
+/// matched against every alias of every known player. The alias match
+/// must be unambiguous.
 pub(super) fn get_player_ucid<'a>(ctx: &'a Context, key: &str) -> Result<Ucid> {
     if let Ok(id) = key.parse::<PlayerId>() {
         if let Some(ifo) = ctx.connected.get(&id) {
@@ -544,6 +593,8 @@ pub(super) fn get_player_ucid<'a>(ctx: &'a Context, key: &str) -> Result<Ucid> {
     bail!("no player found for alias, player id, or ucid \"{}\"", key)
 }
 
+/// Resolve an objective by exact name, falling back to a case
+/// insensitive regex match that must be unambiguous.
 pub fn get_airbase(db: &Db, name: &str) -> Result<ObjectiveId> {
     for (oid, obj) in db.objectives() {
         if obj.name.as_str() == name {
@@ -569,11 +620,15 @@ pub fn get_airbase(db: &Db, name: &str) -> Result<ObjectiveId> {
     }
 }
 
+/// Force a player onto `side`, ignoring the side switch limit
 fn admin_sideswitch(ctx: &mut Context, side: Side, name: String) -> Result<()> {
     let ucid = get_player_ucid(ctx, name.as_str())?;
     ctx.db.force_sideswitch_player(&ucid, side)
 }
 
+/// Modify the campaign config and save it in the background. Used for
+/// settings that live in the config rather than the persisted state,
+/// such as the ban and admin lists.
 fn with_mut_cfg<F: FnOnce(&mut Cfg) -> Result<()>>(ctx: &mut Context, f: F) -> Result<()> {
     {
         let cfg = Arc::make_mut(&mut ctx.db.ephemeral.cfg);
@@ -584,6 +639,8 @@ fn with_mut_cfg<F: FnOnce(&mut Cfg) -> Result<()>>(ctx: &mut Context, f: F) -> R
     Ok(())
 }
 
+/// Ban a player until the specified time (forever if None), and kick
+/// them if they are connected
 fn admin_ban(
     ctx: &mut Context,
     lua: MizLua,
@@ -610,6 +667,7 @@ fn admin_ban(
     Ok(())
 }
 
+/// Kick a connected player. Fails if they aren't connected.
 fn admin_kick(ctx: &mut Context, lua: MizLua, name: &String) -> Result<()> {
     let ucid = get_player_ucid(ctx, name.as_str())?;
     let id = match ctx.connected.id_by_ucid.get(&ucid) {
@@ -620,6 +678,7 @@ fn admin_kick(ctx: &mut Context, lua: MizLua, name: &String) -> Result<()> {
 }
 
 // FreeDanielUnjustifiedBan
+/// Remove a player from the ban list. Fails if they weren't banned.
 fn admin_unban(ctx: &mut Context, name: &String) -> Result<()> {
     let ucid = get_player_ucid(ctx, name.as_str())?;
     with_mut_cfg(ctx, |cfg| match cfg.banned.remove(&ucid) {
@@ -628,6 +687,7 @@ fn admin_unban(ctx: &mut Context, name: &String) -> Result<()> {
     })
 }
 
+/// (ucid, name at the time of the ban, banned until) for every ban
 fn admin_list_banned(ctx: &Context) -> SmallVec<[(Ucid, String, Option<DateTime<Utc>>); 16]> {
     ctx.db
         .ephemeral
@@ -646,6 +706,8 @@ fn admin_list_connected(ctx: &Context) -> SmallVec<[(PlayerId, Ucid, String); 64
         .collect()
 }
 
+/// Find every known player with an alias matching `expr`. The player
+/// id is Some if the player is currently connected.
 fn admin_search(
     ctx: &Context,
     expr: Regex,
@@ -672,6 +734,8 @@ fn admin_search(
         .collect()
 }
 
+/// Write the DCS description and ammo of the unit the player is
+/// currently in to the log as json
 fn admin_log_desc(ctx: &Context, lua: MizLua, ucid: &Ucid) -> Result<()> {
     let slot = &ctx
         .db
@@ -695,17 +759,27 @@ fn admin_log_desc(ctx: &Context, lua: MizLua, ucid: &Ucid) -> Result<()> {
     Ok(())
 }
 
+/// Give a player back all their lives
 fn admin_reset_lives(ctx: &mut Context, player: &String) -> Result<()> {
     let ucid = get_player_ucid(ctx, player)?;
     ctx.db.player_reset_lives(&ucid)
 }
 
+/// Shut the server down. If `reset` is None the state is saved, and
+/// in flight lives are returned to players first. If `reset` is
+/// Some(winner) the saved state is deleted and the round is ended
+/// with the specified winner (or no winner), so the next start will be
+/// a new campaign.
+///
+/// Blocks for up to 60 seconds waiting for the background thread to
+/// finish writing.
 pub(super) fn admin_shutdown(
     ctx: &mut Context,
     lua: MizLua,
     reset: Option<Option<Side>>,
 ) -> Result<AdminResult> {
     let wait = Arc::new((Mutex::new(false), Condvar::new()));
+    // the perf counters are only touched from the main thread, which we are on
     let se = {
         let perf = unsafe { Perf::get_mut() };
         let api_perf = unsafe { ApiPerf::get_mut() };
@@ -727,6 +801,8 @@ pub(super) fn admin_shutdown(
         ));
         ctx.do_bg_task(Task::Stat(se));
     }
+    // the background thread sets the flag and signals once it has
+    // processed every task queued before this one
     ctx.do_bg_task(Task::Shutdown(Arc::clone(&wait)));
     let start = Instant::now();
     let wait_for = Duration::from_secs(60);
@@ -738,6 +814,7 @@ pub(super) fn admin_shutdown(
     Ok(AdminResult::Shutdown)
 }
 
+/// Add a known player to the admin list in the config and save it
 fn add_admin(ctx: &mut Context, player: &String) -> Result<()> {
     let ucid = get_player_ucid(ctx, player)?;
     let name = ctx
@@ -769,6 +846,8 @@ fn balance(ctx: &Context, player: &String) -> Result<i32> {
     Ok(player.points)
 }
 
+/// Set a player's point balance. If `player` is of the form
+/// `objective:<name>` set that objective's points instead.
 fn set_points(ctx: &mut Context, player: &String, amount: i32) -> Result<()> {
     match player.strip_prefix("objective:") {
         None => {
@@ -791,6 +870,8 @@ fn set_points(ctx: &mut Context, player: &String, amount: i32) -> Result<()> {
     }
 }
 
+/// Delete a player or action spawned group. Objective groups can't be
+/// deleted.
 fn delete(ctx: &mut Context, id: &GroupId) -> Result<()> {
     match &ctx.db.group(id)?.origin {
         DeployKind::Objective { .. } | DeployKind::ObjectiveDeprecated => {
@@ -803,12 +884,14 @@ fn delete(ctx: &mut Context, id: &GroupId) -> Result<()> {
     }
 }
 
+/// Queue a player to be moved to spectators on the next timer tick
 fn deslot(ctx: &mut Context, player: &String) -> Result<()> {
     let ucid = get_player_ucid(ctx, player)?;
     ctx.db.ephemeral.force_player_to_spectators(&ucid);
     Ok(())
 }
 
+/// Redraw the F10 map markup for an objective
 fn remark(ctx: &mut Context, objective: &String) -> Result<()> {
     let oid = get_airbase(&ctx.db, objective)?;
     let obj = ctx
@@ -823,13 +906,21 @@ fn remark(ctx: &mut Context, objective: &String) -> Result<()> {
     Ok(())
 }
 
+/// Who issued an admin command, and so where the replies go
 #[derive(Debug)]
 pub(super) enum Caller {
+    /// an admin in game, replies are sent to them in chat
     Player(PlayerId),
+    /// an external client over netidx, replies are collected and sent
+    /// back as the rpc result
     External(oneshot::Sender<NetIdxValue>),
 }
 
+/// Run all the queued admin commands, both from in game admins and
+/// external clients.
 pub(super) fn run_admin_commands(ctx: &mut Context, lua: MizLua) -> Result<AdminResult> {
+    // take the queue so we can borrow ctx mutably while running commands,
+    // it is put back (empty) at the end to reuse the allocation
     let mut cmds = mem::take(&mut ctx.admin_commands);
     while let Some((cmd, ch)) = ctx.external_admin_commands.pop() {
         cmds.push((Caller::External(ch), cmd));
@@ -837,6 +928,8 @@ pub(super) fn run_admin_commands(ctx: &mut Context, lua: MizLua) -> Result<Admin
     let mut result = AdminResult::Continue;
     for (caller, cmd) in cmds.drain(..) {
         let mut replies: SmallVec<[NetIdxValue; 4]> = smallvec![];
+        // reply_ok and reply_err look the same to an in game admin, but
+        // external callers receive reply_err as a netidx Error value
         macro_rules! reply_ok {
             ($($arg:expr),+) => {
                 match caller {
@@ -863,6 +956,8 @@ pub(super) fn run_admin_commands(ctx: &mut Context, lua: MizLua) -> Result<Admin
 
             }
         }
+        // resolve an objective name, or reply with the error and skip to
+        // the next command
         macro_rules! airbase {
             ($name:expr) => {
                 match get_airbase(&ctx.db, $name) {
@@ -875,6 +970,7 @@ pub(super) fn run_admin_commands(ctx: &mut Context, lua: MizLua) -> Result<Admin
             };
         }
         match cmd {
+            // help is handled where the command is received
             AdminCommand::Help => (),
             AdminCommand::ReduceInventory { airbase, amount } => {
                 match ctx
@@ -907,6 +1003,8 @@ pub(super) fn run_admin_commands(ctx: &mut Context, lua: MizLua) -> Result<Admin
                     Err(e) => reply_ok!("failed to repair {e:?}"),
                 }
             }
+            // explode at every mark whose text is exactly key, at ground
+            // level unless alt is given
             AdminCommand::Tim { key, size, alt } => {
                 let mut to_remove: SmallVec<[MarkId; 8]> = smallvec![];
                 let act = Trigger::singleton(lua)?.action()?;
@@ -1037,6 +1135,8 @@ pub(super) fn run_admin_commands(ctx: &mut Context, lua: MizLua) -> Result<Admin
                 Err(e) => reply_err!("the state could not be reset {e:?}"),
             },
         }
+        // external callers get a single value, or an array if the
+        // command produced more than one reply
         match caller {
             Caller::Player(_) => (),
             Caller::External(ch) => {

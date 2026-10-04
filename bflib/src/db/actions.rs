@@ -1,3 +1,21 @@
+//! Campaign actions.
+//!
+//! Actions are configured, point priced abilities that players (or the
+//! server, with no ucid) can trigger: calling in AI aircraft (awacs, tankers,
+//! fighters, attackers, SEAD, drones, cruise missile carriers, bombers),
+//! AI logistics flights (repair, supply transfer), paratroopers and AI
+//! delivered deployables, moving ground units, sending AI aircraft home
+//! (RTB), and nukes.
+//!
+//! Most actions target a map mark: the player places an F10 map mark with a
+//! unique text key and passes that key as the action argument
+//! ([`ActionArgs::parse`]). [`Db::start_action`] validates cost, limits and
+//! authorization, spawns or re-tasks the group, and charges the player.
+//! Spawned action groups are tagged `DeployKind::Action` and tracked in
+//! `persisted.actions`; [`Db::advance_actions`] runs periodically to expire
+//! them, and to trigger their effect (bombing, repair, transfer, troop or
+//! deployable drop) when they reach their destination.
+
 use super::{Db, MapM, objective::Objective};
 use crate::{
     admin,
@@ -47,18 +65,21 @@ use rand::{Rng, thread_rng};
 use smallvec::{SmallVec, smallvec};
 use std::{cmp::max, f64, vec};
 
+/// Action config plus a target position (from a map mark, x/z plane meters).
 #[derive(Debug, Clone)]
 pub struct WithPos<T> {
     pub cfg: T,
     pub pos: Vector2,
 }
 
+/// Action config plus a target objective (an airbase).
 #[derive(Debug, Clone)]
 pub struct WithObj<T> {
     pub cfg: T,
     pub oid: ObjectiveId,
 }
 
+/// Action config plus source and destination objectives (airbases).
 #[derive(Debug, Clone)]
 pub struct WithFromTo<T> {
     pub cfg: T,
@@ -66,6 +87,7 @@ pub struct WithFromTo<T> {
     pub to: ObjectiveId,
 }
 
+/// Action config plus a target position and the existing group to re-task.
 #[derive(Debug, Clone)]
 pub struct WithPosAndGroup<T> {
     pub cfg: T,
@@ -73,12 +95,16 @@ pub struct WithPosAndGroup<T> {
     pub group: GroupId,
 }
 
+/// Action config plus the jtac whose target (or position) is the target.
 #[derive(Debug, Clone)]
 pub struct WithJtac<T> {
     pub cfg: T,
     pub jtac: JtId,
 }
 
+/// Parsed, resolved arguments for an action. Each variant corresponds to an
+/// [`ActionKind`]. The `*Waypoint`, `Move`, and `Rtb` variants re-task an
+/// existing group rather than spawning a new one.
 #[derive(Debug, Clone)]
 pub enum ActionArgs {
     Tanker(WithPos<AiPlaneCfg>),
@@ -106,6 +132,13 @@ pub enum ActionArgs {
 }
 
 impl ActionArgs {
+    /// Parse the argument string `s` for an action of kind `action` issued by
+    /// `side`. Depending on the kind, `s` is a mark key, `<gid> <key>`, a
+    /// jtac id, an airbase name, or `<from> <to>` airbase names.
+    ///
+    /// Mark keys must match exactly one of `side`'s map marks; the matched
+    /// mark is deleted as a side effect. Errors if a key, group id, jtac id,
+    /// or airbase can't be resolved.
     pub fn parse(
         db: &mut Db,
         action: &ActionKind,
@@ -113,6 +146,8 @@ impl ActionArgs {
         side: Side,
         s: &str,
     ) -> Result<Self> {
+        /// Find the unique map mark visible to `side` whose text is `key`,
+        /// delete it, and return its position.
         fn get_key_pos(db: &mut Db, lua: MizLua, side: Side, key: &str) -> Result<Vector2> {
             let mut found: SmallVec<[(MarkId, Vector2); 4]> = smallvec![];
             for mk in World::singleton(lua)?.get_mark_panels()? {
@@ -134,6 +169,8 @@ impl ActionArgs {
                 Ok(found[0].1)
             }
         }
+        /// Like `get_key_pos`, but return the position of the airbase
+        /// objective (of any owner) closest to the mark.
         fn get_closest_base(db: &mut Db, lua: MizLua, side: Side, key: &str) -> Result<Vector2> {
             let mut found: SmallVec<[(MarkId, Vector2); 4]> = smallvec![];
             for mk in World::singleton(lua)?.get_mark_panels()? {
@@ -273,6 +310,8 @@ impl ActionArgs {
         }
     }
 
+    /// The target position of the action, if it has one. Used to enforce
+    /// geographic limits. Bomber and logistics actions return `None`.
     fn pos(&self) -> Option<Vector2> {
         match self {
             Self::Attackers(c) => Some(c.pos),
@@ -301,14 +340,19 @@ impl ActionArgs {
     }
 }
 
+/// A fully parsed action request, ready for [`Db::start_action`].
 #[derive(Debug, Clone)]
 pub struct ActionCmd {
+    /// The action's name in the side's action config.
     pub name: String,
+    /// The action's config, cloned from the campaign config.
     pub action: Action,
     pub args: ActionArgs,
 }
 
 impl ActionCmd {
+    /// Parse `<action> <args>`, looking up `<action>` in `side`'s configured
+    /// actions and parsing `<args>` with [`ActionArgs::parse`].
     pub fn parse(db: &mut Db, lua: MizLua, side: Side, s: &str) -> Result<Self> {
         match s.split_once(" ") {
             None => Err(anyhow!("expected <action> <args>")),
@@ -334,6 +378,9 @@ impl ActionCmd {
 
 // setup the awacs race track 90 degrees offset from the heading
 // to the nearest enemy objective
+/// Returns (distance in meters to the nearest `enemy` objective, racetrack
+/// heading in radians). If there are no enemy objectives the distance is a
+/// huge sentinel and the heading is 0.
 fn racetrack_dist_and_heading(
     obj: &MapM<ObjectiveId, Objective>,
     pos: Vector2,
@@ -345,6 +392,7 @@ fn racetrack_dist_and_heading(
     }
 }
 
+/// Current live (from DCS) 2d position of the first unit of group `name`.
 fn group_position(lua: MizLua, name: &str) -> Result<Vector2> {
     let pos = Group::get_by_name(lua, name)
         .context("getting group")?
@@ -355,6 +403,16 @@ fn group_position(lua: MizLua, name: &str) -> Result<Vector2> {
 }
 
 impl Db {
+    /// Execute an action for `side`, on behalf of player `ucid` (or the
+    /// server if `None`).
+    ///
+    /// Computes the cost (nukes are scaled by `nukes_used`, paratroopers and
+    /// deployables add the unit cost, moves are charged per `step` meters of
+    /// distance), then for a player checks authorization, points, and side.
+    /// Also enforces the per side action limit and any geographic limit.
+    /// On success the player is charged and the action is counted against
+    /// the limit. Errors (without charging) if any check or the action
+    /// itself fails.
     pub fn start_action(
         &mut self,
         lua: MizLua,
@@ -452,6 +510,7 @@ impl Db {
         match cmd.action.geo_limit {
             ActionGeoLimit::Unlimited => (),
             ActionGeoLimit::NearFriendlyObjective { max } => {
+                // passes if the action has no position or side has no objectives
                 if let Some(pos) = cmd.args.pos()
                     && let Some((dist, _, _)) =
                         Db::objective_near_point(&self.persisted.objectives, pos, |obj| {
@@ -466,6 +525,7 @@ impl Db {
             }
         }
         let name = cmd.name.clone();
+        // gid is the group spawned or affected, if any, recorded in the stat
         let gid = match cmd.args {
             ActionArgs::Awacs(args) => self
                 .awacs(perf, spctx, idx, side, ucid.clone(), name, cmd.action, args)
@@ -575,6 +635,13 @@ impl Db {
         Ok(())
     }
 
+    /// Respawn action group `gid` after a server restart.
+    ///
+    /// Loitering air actions spawned in the air (awacs, tanker, cruise
+    /// missile, drone, fighters, attackers, SEAD) are respawned at their
+    /// last known position with a freshly generated mission, unless their
+    /// configured duration (hours) has expired. Every other action group
+    /// (and any expired one) is deleted.
     pub(super) fn respawn_action(
         &mut self,
         perf: &mut PerfInner,
@@ -734,6 +801,8 @@ impl Db {
         self.delete_group(&gid)
     }
 
+    /// Mission for a drone: fly from `spawn_point` and orbit (circle) the
+    /// target point. The drone group acts as a jtac.
     fn drone_mission<'lua>(
         &mut self,
         side: Side,
@@ -756,6 +825,8 @@ impl Db {
         )
     }
 
+    /// Re-task an existing drone to orbit a new point, starting from its
+    /// current position.
     fn move_drone(
         &mut self,
         spctx: &SpawnCtx,
@@ -774,6 +845,7 @@ impl Db {
         Ok(None)
     }
 
+    /// Spawn a drone and send it to orbit the target point.
     fn drone(
         &mut self,
         perf: &mut PerfInner,
@@ -815,6 +887,8 @@ impl Db {
         )?))
     }
 
+    /// Mission for AI fighters: orbit the target point with unlimited fuel,
+    /// engaging air targets within 30 km.
     fn ai_fighters_mission<'lua>(
         &mut self,
         side: Side,
@@ -853,6 +927,7 @@ impl Db {
         )
     }
 
+    /// Re-task existing AI fighters to a new orbit point.
     fn move_ai_fighters(
         &mut self,
         spctx: &SpawnCtx,
@@ -871,6 +946,7 @@ impl Db {
         Ok(None)
     }
 
+    /// Spawn AI fighters and send them to orbit the target point.
     fn ai_fighters(
         &mut self,
         perf: &mut PerfInner,
@@ -909,6 +985,8 @@ impl Db {
         )?))
     }
 
+    /// Mission for AI attackers: orbit the target point with unlimited fuel,
+    /// engaging air and ground targets within 15 km.
     fn ai_attackers_mission<'lua>(
         &mut self,
         side: Side,
@@ -950,6 +1028,8 @@ impl Db {
         )
     }
 
+    /// Mission for AI SEAD: orbit the target point with unlimited fuel,
+    /// engaging air defences and radars within 15 km.
     fn ai_sead_mission<'lua>(
         &mut self,
         side: Side,
@@ -1001,6 +1081,7 @@ impl Db {
         )
     }
 
+    /// Re-task existing AI attackers to a new orbit point.
     fn move_ai_attackers(
         &mut self,
         spctx: &SpawnCtx,
@@ -1019,6 +1100,7 @@ impl Db {
         Ok(None)
     }
 
+    /// Re-task existing AI SEAD aircraft to a new orbit point.
     fn move_ai_sead(
         &mut self,
         spctx: &SpawnCtx,
@@ -1037,6 +1119,7 @@ impl Db {
         Ok(None)
     }
 
+    /// Spawn AI attackers and send them to orbit the target point.
     fn ai_attackers(
         &mut self,
         perf: &mut PerfInner,
@@ -1075,6 +1158,7 @@ impl Db {
         )?))
     }
 
+    /// Spawn AI SEAD aircraft and send them to orbit the target point.
     fn ai_sead(
         &mut self,
         perf: &mut PerfInner,
@@ -1113,6 +1197,13 @@ impl Db {
         )?))
     }
 
+    /// Order friendly ground group `args.group` to drive off road to
+    /// `args.pos` at 20 m/s, engaging targets within 2 km on the way.
+    ///
+    /// The group's units are marked as able to move so their positions are
+    /// tracked. If `penalty` is non zero and `ucid` is moving another
+    /// player's deployed group or troops, `moved_by` records the mover and
+    /// penalty. Errors if the group belongs to the other side.
     fn move_group(
         &mut self,
         spctx: &SpawnCtx,
@@ -1223,6 +1314,8 @@ impl Db {
         Ok(None)
     }
 
+    /// Send action aircraft `args.group` home to the airbase nearest
+    /// `args.pos`. See [`Db::ai_rtb_mission`].
     fn rtb(&mut self, spctx: &SpawnCtx, mut args: WithPosAndGroup<()>) -> Result<Option<GroupId>> {
         let gid = args.group;
         let mission = self
@@ -1232,6 +1325,8 @@ impl Db {
         Ok(Some(gid))
     }
 
+    /// Mission for a tanker: fly a racetrack at the target point with
+    /// unlimited fuel on the configured frequency (AM, defaults to 264 MHz).
     fn tanker_mission<'lua>(
         &mut self,
         side: Side,
@@ -1271,6 +1366,7 @@ impl Db {
         )
     }
 
+    /// Re-task an existing tanker to a new racetrack.
     fn move_tanker(
         &mut self,
         spctx: &SpawnCtx,
@@ -1288,6 +1384,7 @@ impl Db {
         Ok(None)
     }
 
+    /// Spawn a tanker and send it to its racetrack.
     fn tanker(
         &mut self,
         perf: &mut PerfInner,
@@ -1326,6 +1423,7 @@ impl Db {
         )?))
     }
 
+    /// Re-task an existing cruise missile carrier to a new orbit point.
     fn move_cruise_missile<'lua>(
         &mut self,
         spctx: &SpawnCtx<'lua>,
@@ -1344,6 +1442,7 @@ impl Db {
         Ok(Some(gid))
     }
 
+    /// Spawn a cruise missile carrier and send it to orbit the target point.
     fn cruise_missile(
         &mut self,
         perf: &mut PerfInner,
@@ -1384,6 +1483,9 @@ impl Db {
         Ok(Some(gid))
     }
 
+    /// Spawn a transport that flies to the target point, where
+    /// [`Db::advance_actions`] drops the configured troop squad, then
+    /// returns. Errors if the paratrooper config has no plane.
     fn paratroops(
         &mut self,
         perf: &mut PerfInner,
@@ -1420,6 +1522,8 @@ impl Db {
         ))
     }
 
+    /// Detonate an explosion of the configured power 500 m above the ground
+    /// at the target point, and count it in `nukes_used`.
     fn nuke(&mut self, spctx: &SpawnCtx, args: WithPos<NukeCfg>) -> Result<Option<GroupId>> {
         let land = Land::singleton(spctx.lua())?;
         let act = Trigger::singleton(spctx.lua())?.action()?;
@@ -1431,6 +1535,9 @@ impl Db {
         Ok(None)
     }
 
+    /// Spawn a cargo aircraft that flies from the `from` airbase to the `to`
+    /// airbase. On arrival [`Db::advance_actions`] transfers supplies and
+    /// removes the aircraft.
     fn ai_logistics_transfer(
         &mut self,
         perf: &mut PerfInner,
@@ -1463,6 +1570,9 @@ impl Db {
         )?))
     }
 
+    /// Spawn a cargo aircraft that flies to the target airbase. On arrival
+    /// [`Db::advance_actions`] repairs one logistics step there and removes
+    /// the aircraft.
     fn ai_logistics_repair(
         &mut self,
         perf: &mut PerfInner,
@@ -1494,6 +1604,9 @@ impl Db {
         )?))
     }
 
+    /// Deploy a deployable at the target point. If the config has a plane,
+    /// an aircraft delivers it (via [`Db::advance_actions`]); otherwise it is
+    /// deployed immediately and no group id is returned.
     fn ai_deploy(
         &mut self,
         lua: MizLua,
@@ -1538,6 +1651,10 @@ impl Db {
         }
     }
 
+    /// Two waypoint mission for point to point actions (bomber, logistics,
+    /// paratrooper, and air delivered deployables): fly to the group's
+    /// `destination`, then back to its `rtb` point. Errors if the group is
+    /// not such an action group or lacks either point.
     fn ai_point_to_point_mission<'lua>(
         &mut self,
         gid: GroupId,
@@ -1596,6 +1713,13 @@ impl Db {
         Ok(vec![wpt!("tgt", tgt), wpt!("rtb", src)])
     }
 
+    /// Build a single waypoint mission sending an air action group to the
+    /// airbase objective (of any owner) nearest `args.pos`.
+    ///
+    /// Converts the group's action kind to [`ActionKind::Rtb`], sets its
+    /// `rtb` point, and deletes its map marks, so [`Db::advance_actions`]
+    /// will remove it (and partially refund the player) on arrival. Errors
+    /// if the group is not a supported air action or there are no airbases.
     fn ai_rtb_mission<'lua>(
         &mut self,
         args: &mut WithPosAndGroup<()>,
@@ -1714,6 +1838,9 @@ impl Db {
         }])
     }
 
+    /// Spawn a bomber that flies to the jtac's current target (or the jtac's
+    /// own position if it has none). On arrival [`Db::advance_actions`] calls
+    /// [`Db::bomb_targets`].
     fn bomber_strike(
         &mut self,
         perf: &mut PerfInner,
@@ -1751,6 +1878,15 @@ impl Db {
         )?))
     }
 
+    /// Create and spawn an AI aircraft group for an action.
+    ///
+    /// The group spawns in the air over the nearest friendly, non
+    /// capturable objective that is more than 10 km from `args.pos` (fixed
+    /// wing aircraft additionally require an airbase or one of the
+    /// configured extra fixed wing objectives). That objective becomes the
+    /// group's `rtb` point. `gen_mission` is called with the new group id
+    /// and spawn position to build its route. Errors if no suitable
+    /// objective exists.
     fn add_and_spawn_ai_air<'lua>(
         &mut self,
         perf: &mut PerfInner,
@@ -1780,6 +1916,7 @@ impl Db {
                                 .contains(&o.name)
                     }
                 }
+                // more than 10 km away
                 && na::distance_squared(&args.pos.into(), &o.zone.pos().into()) > 100_000_000.
         })
         .ok_or_else(|| anyhow!("no objectives available for the ai mission"))?;
@@ -1827,6 +1964,9 @@ impl Db {
         Ok(gid)
     }
 
+    /// Mission for an awacs: fly a racetrack at the target point with
+    /// unlimited fuel on the configured AM frequency. Link16 capable groups
+    /// also enable EPLRS and default to 264 MHz; others default to 125 MHz.
     fn awacs_mission<'lua>(
         &mut self,
         side: Side,
@@ -1883,6 +2023,7 @@ impl Db {
         )
     }
 
+    /// Re-task an existing awacs to a new racetrack.
     fn move_awacs<'lua>(
         &mut self,
         spctx: &SpawnCtx<'lua>,
@@ -1901,6 +2042,7 @@ impl Db {
         Ok(None)
     }
 
+    /// Spawn an awacs and send it to its racetrack.
     fn awacs(
         &mut self,
         perf: &mut PerfInner,
@@ -1942,6 +2084,19 @@ impl Db {
         )?))
     }
 
+    /// Shared mission builder for loitering air actions.
+    ///
+    /// Builds an "ip" waypoint at `spawn_point` running `init_task`, then
+    /// either a circular orbit at `args.pos` or a 60 km racetrack centered
+    /// on `args.pos`, oriented perpendicular to the nearest enemy objective.
+    /// Orbit waypoints run `main_task`. Map marks showing the orbit and the
+    /// responsible player are placed for `side`, replacing old marks, and
+    /// the group's stored spawn position is updated to `args.pos` so it
+    /// respawns there.
+    ///
+    /// `validator` must accept the group's action kind. Errors if the group
+    /// is on the other side, is not an in air loitering action, or the
+    /// pattern is `Custom`.
     fn ai_loiter_point_mission<'lua>(
         &mut self,
         side: Side,
@@ -1986,6 +2141,10 @@ impl Db {
                     | ActionKind::Sead(a) => {
                         match loc {
                             SpawnLoc::InAir { pos: oldpos, .. } => {
+                                // sample 3 points spaced by 1/4 of the move distance along
+                                // dir; if any is >= 500 m farther from the nearest enemy
+                                // objective than the old position, the issuing player
+                                // (or nobody, for server actions) becomes responsible
                                 let dir = *oldpos - args.pos;
                                 let step = dir.magnitude() / 4.;
                                 let dir = dir.normalize();
@@ -2062,6 +2221,7 @@ impl Db {
                 (args.pos, None)
             }
             OrbitPattern::RaceTrack => {
+                // legs extend 30 km either side of the target point
                 let point1 = args.pos
                     + pointing_towards2(change_heading(heading, -f64::consts::PI)) * 30_000.;
                 let point2 = args.pos + pointing_towards2(heading) * 30_000.;
@@ -2149,6 +2309,8 @@ impl Db {
         }
     }
 
+    /// Mission for a cruise missile carrier: orbit (circle) the target point
+    /// with unlimited fuel.
     fn cruise_missile_mission<'lua>(
         &mut self,
         side: Side,
@@ -2178,6 +2340,8 @@ impl Db {
         )
     }
 
+    /// Replace the live DCS group's current task with an airborne mission
+    /// following `mission`. Note the task is set twice.
     fn set_ai_mission<'lua>(
         &mut self,
         spctx: &SpawnCtx<'lua>,
@@ -2198,6 +2362,10 @@ impl Db {
         .context("setting mission")
     }
 
+    /// Simulate a bomber's payload: for up to `cfg.targets` jtac contacts
+    /// known to `side` within 15 km of `target`, create an explosion of
+    /// `cfg.power` on the ground at a random offset of up to `cfg.accuracy`
+    /// meters from the contact.
     fn bomb_targets(
         &self,
         lua: MizLua,
@@ -2222,6 +2390,8 @@ impl Db {
         Ok(())
     }
 
+    /// Repair one logistics step at the friendly objective nearest `target`.
+    /// Errors if there is none within 5 km.
     fn repair_target(&mut self, target: Vector2, ucid: Option<Ucid>, side: Side) -> Result<()> {
         let (dist, _, obj) =
             Self::objective_near_point(&self.persisted.objectives, target, |o| o.owner == side)
@@ -2237,6 +2407,8 @@ impl Db {
         Ok(())
     }
 
+    /// Transfer supplies between the friendly objectives nearest `src` and
+    /// `target`. Errors if either has no friendly objective within 5 km.
     fn transfer_to_target(
         &mut self,
         lua: MizLua,
@@ -2269,6 +2441,10 @@ impl Db {
         self.transfer_supplies(lua, src, tgt)
     }
 
+    /// Deploy the deployable named `dep` at `pos` on behalf of `ucid`, as a
+    /// FARP objective or a ground group depending on its kind. If the
+    /// deployable's limit is reached, either fails or deletes the oldest
+    /// instance, per its limit enforcement setting.
     fn deployable_to_point(
         &mut self,
         lua: MizLua,
@@ -2344,6 +2520,9 @@ impl Db {
         }
     }
 
+    /// Spawn the troop squad named `troop` at `pos` on behalf of `ucid`,
+    /// enforcing the squad's deploy limit like [`Db::deployable_to_point`].
+    /// `origin` is the objective the paratroop flight departed from.
     fn paratroops_to_point(
         &mut self,
         lua: MizLua,
@@ -2412,6 +2591,17 @@ impl Db {
     }
 
 
+    /// Periodic update for action groups.
+    ///
+    /// Deletes loitering air actions whose duration (hours) has expired, and
+    /// checks point to point actions against their destination (10 km for
+    /// bombers and RTB, 800 m for logistics, paratroops and deployables).
+    /// On arrival the action's effect is triggered, and groups that return
+    /// to their `rtb` point are deleted. RTB'd groups refund 25% of the
+    /// action cost to the responsible player.
+    ///
+    /// Effects are collected first and applied after the loop. Failures of
+    /// individual effects are reported to the side or player, not returned.
     pub fn advance_actions(
         &mut self,
         lua: MizLua,
@@ -2426,6 +2616,8 @@ impl Db {
         let mut to_deploy: SmallVec<[(Vector2, String, Side, Ucid); 2]> = smallvec![];
         let mut to_paratroop: SmallVec<[(Vector2, String, Side, Ucid, ObjectiveId); 2]> =
             smallvec![];
+        // true if any unit of the group is within $radius meters of $dest
+        // (using the last recorded unit positions)
         macro_rules! at_dest {
             ($group:expr, $dest:expr, $radius:expr) => {{
                 let r2 = f64::powi($radius, 2);
@@ -2482,6 +2674,8 @@ impl Db {
                         // SEAD groups now require manual RTB - no automatic RTB based on ammunition
                     }
                     ActionKind::Bomber(b) => {
+                        // destination is cleared once reached, after which the group
+                        // heads for its rtb point
                         if let Some(target) = *destination {
                             if at_dest!(group, target, 10_000.) {
                                 destination.take();
@@ -2588,6 +2782,8 @@ impl Db {
                         }
                     }
                     ActionKind::Move(_) => {
+                        // drop move missions whose group is gone or within 100 m of its
+                        // destination, and stop tracking movement of its non driveable units
                         self.ephemeral.groups_with_move_missions.retain(|gid, dst| {
                             match self.persisted.groups.get(gid) {
                                 None => false,

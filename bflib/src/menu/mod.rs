@@ -14,6 +14,15 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! F10 radio menus.
+//!
+//! Each player slot gets per-group F10 submenus (EWR, Cargo, Troops, JTAC,
+//! Actions) built by [`init_for_slot`] according to the aircraft's
+//! capabilities and the campaign's rules for that player. Menu callbacks
+//! receive their arguments as Lua values, so this module also provides
+//! small tuple types ([`ArgTuple`], [`ArgTriple`], [`ArgQuad`], `ArgPent`)
+//! that round trip through Lua as 1-indexed arrays.
+
 pub mod action;
 pub mod cargo;
 mod ewr;
@@ -37,6 +46,7 @@ use log::debug;
 use mlua::{prelude::*, Value};
 use std::sync::Arc;
 
+/// Two menu callback arguments, passed to Lua as `{fst, snd}`.
 #[derive(Debug)]
 pub struct ArgTuple<T, U> {
     pub fst: T,
@@ -70,6 +80,7 @@ where
     }
 }
 
+/// Three menu callback arguments, passed to Lua as `{fst, snd, trd}`.
 #[derive(Debug)]
 pub struct ArgTriple<T, U, V> {
     pub fst: T,
@@ -108,6 +119,7 @@ where
     }
 }
 
+/// Four menu callback arguments, passed to Lua as `{fst, snd, trd, fth}`.
 #[derive(Debug)]
 pub struct ArgQuad<T, U, V, W> {
     pub fst: T,
@@ -151,6 +163,7 @@ where
     }
 }
 
+/// Five menu callback arguments, passed to Lua as a 5 element array.
 #[derive(Debug)]
 struct ArgPent<T, U, V, W, X> {
     fst: T,
@@ -199,6 +212,10 @@ where
     }
 }
 
+/// Find the side and slot of the player group `gid` that invoked a menu.
+///
+/// Dynamic slots are looked up directly; otherwise the group is found in the
+/// miz and must contain exactly one unit (multi-unit groups are an error).
 fn slot_for_group(lua: MizLua, ctx: &Context, gid: &GroupId) -> Result<(Side, SlotId)> {
     let miz = Miz::singleton(lua)?;
     // dynamic slot
@@ -220,6 +237,7 @@ fn slot_for_group(lua: MizLua, ctx: &Context, gid: &GroupId) -> Result<(Side, Sl
     Ok((group.side, unit.slot().context("getting unit slot")?))
 }
 
+/// Name of the player in `slot`, or an empty string if there is none.
 fn player_name(db: &Db, slot: &SlotId) -> String {
     db.ephemeral
         .player_in_slot(&slot)
@@ -227,6 +245,7 @@ fn player_name(db: &Db, slot: &SlotId) -> String {
         .unwrap_or_default()
 }
 
+/// What kinds of cargo an aircraft type can carry.
 #[derive(Debug, Clone, Copy, Default)]
 struct CarryCap {
     troops: bool,
@@ -234,6 +253,8 @@ struct CarryCap {
 }
 
 impl CarryCap {
+    /// Look up the cargo capability of `typ` in the config. Types with no
+    /// cargo config can carry nothing.
     fn from_typ(cfg: &Cfg, typ: &str) -> CarryCap {
         cfg.cargo
             .get(&*typ)
@@ -245,6 +266,13 @@ impl CarryCap {
     }
 }
 
+/// (Re)build the F10 menus for the player in `slot`.
+///
+/// Existing EWR, Cargo, Troops, and Actions menus are removed first. EWR is
+/// always added; Cargo and Troops
+/// only if the aircraft can carry them; and Cargo, Troops, JTAC, and Actions
+/// only if the campaign rules allow this player to use them. Non-unit slots
+/// (spectators, combined arms roles) and empty slots get no menus.
 pub(super) fn init_for_slot(ctx: &mut Context, lua: MizLua, slot: &SlotId) -> Result<()> {
     debug!("initializing menus for {slot:?}");
     let cfg = Arc::clone(&ctx.db.ephemeral.cfg);

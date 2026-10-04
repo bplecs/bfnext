@@ -14,6 +14,19 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Spawned groups and units.
+//!
+//! Every group the campaign creates (objective defenses, player deployables,
+//! troops, crates, and actions) is recorded in the db as a [`SpawnedGroup`]
+//! with its [`SpawnedUnit`]s, so it can be persisted and respawned across
+//! restarts and culling. Groups are created from miz templates by
+//! [`Db::add_group`], which computes unit positions for a [`SpawnLoc`]; the
+//! actual DCS spawn is queued separately.
+//!
+//! This module also handles DCS birth/death events for units and statics
+//! (including validating players in dynamic slots), F10 map marks for
+//! groups, and incremental tracking of unit positions.
+
 use super::{ephemeral::SlotInfo, objective::ObjGroupClass, player::SlotAuth, Db, SetS};
 use crate::{
     group, group_by_name, group_health, group_mut, objective,
@@ -55,50 +68,76 @@ use serde_derive::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 use std::{cmp::max, collections::VecDeque};
 
+/// The result of handling a unit birth event in [`Db::unit_born`].
 #[derive(Debug, Clone)]
 pub enum BirthRes {
+    /// Nothing for the caller to do (a db unit was born, or an empty
+    /// slot was destroyed)
     None,
+    /// A player successfully occupied this slot
     OccupiedSlot(SlotId),
+    /// A player spawned in a dynamic slot they aren't allowed to use. The
+    /// unit has already been destroyed.
     DynamicSlotDenied(Ucid, SlotAuth),
 }
 
+/// serde default for `cost_fraction`, groups saved before it existed paid
+/// full price
 fn default_cost_fraction() -> f32 {
     1.
 }
 
+/// Where a group came from. Determines which db indexes it is in (see
+/// [`Db::add_group`] and [`Db::delete_group`]) and how it is marked.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum DeployKind {
+    /// An objective group from an old save format that didn't record the
+    /// objective. Kept for deserialization compatibility.
     #[serde(rename = "Objective")]
     ObjectiveDeprecated,
+    /// A group belonging to the objective `origin`
     #[serde(rename = "ObjectiveV2")]
     Objective {
         origin: ObjectiveId,
     },
+    /// A deployable unpacked by `player`
     Deployed {
         player: Ucid,
+        /// The last player to move the group, and the points they will
+        /// lose if it is destroyed
         #[serde(default)]
         moved_by: Option<(Ucid, u32)>,
         spec: Deployable,
+        /// The fraction of the full cost that was charged, used to scale refunds
         #[serde(default = "default_cost_fraction")]
         cost_fraction: f32,
         #[serde(default)]
         origin: Option<ObjectiveId>,
     },
+    /// Troops unloaded by `player`
     Troop {
         player: Ucid,
+        /// The objective the troops were loaded at, if any
         origin: Option<ObjectiveId>,
+        /// The last player to move the group, and the points they will
+        /// lose if it is destroyed
         #[serde(default)]
         moved_by: Option<(Ucid, u32)>,
         spec: Troop,
+        /// The fraction of the full cost that was charged, used to scale refunds
         #[serde(default = "default_cost_fraction")]
         cost_fraction: f32,
     },
+    /// A cargo crate spawned by `player` at objective `origin`
     Crate {
         origin: ObjectiveId,
         player: Ucid,
         spec: Crate,
     },
+    /// A group spawned by an action (e.g. drone, awacs, bomber). `player` is
+    /// None when the server initiated it.
     Action {
+        /// Extra map marks owned by the action (e.g. its destination)
         #[serde(skip)]
         marks: FxHashSet<MarkId>,
         loc: SpawnLoc,
@@ -115,14 +154,20 @@ pub enum DeployKind {
     },
 }
 
+/// A unit created by the campaign. `spawn_*` fields record where the unit
+/// was originally placed; the others are its last known position. Positions
+/// are in meters, headings in radians. `pos` is the 2d (x, z) projection of
+/// `position`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpawnedUnit {
+    /// The unique name used to spawn the unit in DCS
     pub name: String,
     pub id: UnitId,
     pub group: GroupId,
     pub side: Side,
     pub typ: Vehicle,
     pub tags: UnitTags,
+    /// The name of the unit in the miz template it was created from
     pub template_name: String,
     pub spawn_pos: Vector2,
     pub spawn_heading: f64,
@@ -130,23 +175,30 @@ pub struct SpawnedUnit {
     pub pos: Vector2,
     pub heading: f64,
     pub position: Position3,
+    /// Dead units stay in the db so they can be repaired / respawned
     pub dead: bool,
+    /// The last time the unit was observed to move
     #[serde(skip)]
     pub moved: Option<DateTime<Utc>>,
+    /// The unit's velocity if it is an aircraft in the air
     #[serde(skip)]
     pub airborne_velocity: Option<Vector3>,
 }
 
+/// A group created by the campaign from a miz template
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnedGroup {
     pub id: GroupId,
+    /// The unique name used to spawn the group in DCS
     pub name: String,
     pub template_name: String,
     pub side: Side,
+    /// The DCS group category, or None if the group is made of statics
     pub kind: Option<GroupCategory>,
     pub class: ObjGroupClass,
     pub origin: DeployKind,
     pub units: SetS<UnitId>,
+    /// The union of the tags of all units in the group
     pub tags: UnitTags,
 }
 
@@ -160,6 +212,7 @@ impl Db {
         group!(self, id)
     }
 
+    /// The 2d centroid of the group's living units
     pub fn group_center(&self, id: &GroupId) -> Result<Vector2> {
         let group = group!(self, id)?;
         Ok(centroid2d(
@@ -171,6 +224,7 @@ impl Db {
         ))
     }
 
+    /// The 3d centroid of the group's living units
     #[allow(dead_code)]
     pub fn group_center3(&self, id: &GroupId) -> Result<Vector3> {
         let group = group!(self, id)?;
@@ -205,6 +259,8 @@ impl Db {
         unit_by_name!(self, name)
     }
 
+    /// The DCS object id of the first unit in the group that currently
+    /// exists in the mission. Fails if none do.
     pub fn first_living_unit(&self, gid: &GroupId) -> Result<&DcsOid<ClassUnit>> {
         group!(self, gid)?
             .units
@@ -213,6 +269,7 @@ impl Db {
             .ok_or_else(|| anyhow!("all units are dead"))
     }
 
+    /// All db units that currently exist in DCS, with their object ids
     pub fn instanced_units(
         &self,
     ) -> impl Iterator<Item = (&SpawnedUnit, &DcsOid<ClassUnit>)> {
@@ -221,6 +278,7 @@ impl Db {
         })
     }
 
+    /// All player deployed groups and troops
     pub fn deployed(&self) -> impl Iterator<Item = &SpawnedGroup> {
         self.persisted
             .deployed
@@ -229,6 +287,7 @@ impl Db {
             .filter_map(|gid| self.persisted.groups.get(gid))
     }
 
+    /// All action groups. Note that troops are included as well.
     pub fn actions(&self) -> impl Iterator<Item = &SpawnedGroup> {
         self.persisted
             .actions
@@ -237,6 +296,11 @@ impl Db {
             .filter_map(|gid| self.persisted.groups.get(gid))
     }
 
+    /// (Re)create the F10 map mark for a group, visible to its side, at the
+    /// centroid of its units. The text describes the group and who deployed
+    /// (and moved) it. Objective groups are only marked when owned by the
+    /// objective's owner. Actions with a destination also get a one time
+    /// destination mark stored in the action's `marks`.
     pub(super) fn mark_group(&mut self, gid: &GroupId) -> Result<()> {
         if let Some(id) = self.ephemeral.group_marks.remove(gid) {
             self.ephemeral.msgs.delete_mark(id)
@@ -356,6 +420,9 @@ impl Db {
         Ok(())
     }
 
+    /// Remove a group and its units from the db and all indexes, delete its
+    /// marks, and queue it to be despawned from DCS. Fails if the group
+    /// doesn't exist.
     pub fn delete_group(&mut self, gid: &GroupId) -> Result<()> {
         let group = self
             .persisted
@@ -429,6 +496,14 @@ impl Db {
     }
 
     /// add the units to the db, but don't actually spawn them
+    ///
+    /// The group is built from the miz template `template_name` for `side`,
+    /// with unit positions computed from `location`. Ground placements fail
+    /// if a boat would be on land or any other unit in water (crates may be
+    /// placed anywhere). `extra_tags` are added to every unit. Group and unit
+    /// names get a unique id suffix, except naval spawn points, which keep
+    /// their template names. Also registers the group in the index matching
+    /// its `origin` and marks it on the map.
     pub(super) fn add_group<'lua>(
         &mut self,
         spctx: &'lua SpawnCtx<'lua>,
@@ -439,6 +514,8 @@ impl Db {
         origin: DeployKind,
         extra_tags: BitFlags<UnitTag>,
     ) -> Result<GroupId> {
+        /// Fold the distances from `pos` to `positions` with `cmp` (e.g.
+        /// `f64::max` for the farthest). Returns 0 if `positions` is empty.
         fn distance<'a, F: Fn(f64, f64) -> f64>(
             pos: Vector2,
             cmp: F,
@@ -463,11 +540,15 @@ impl Db {
             position: Vector2,
             altitude: Option<f64>,
         }
+        /// Computed unit positions in template unit order. Units whose type
+        /// has a component position are kept separately in `by_type`.
         #[derive(Debug)]
         struct GroupPosition {
             positions: VecDeque<UnitPosition>,
             by_type: FxHashMap<String, VecDeque<UnitPosition>>,
         }
+        /// Translate (and for most locations rotate) the template's unit
+        /// positions to `location`. Altitude is only kept for `InAir`.
         fn compute_unit_positions(
             spctx: &SpawnCtx,
             idx: &MizIndex,
@@ -529,6 +610,8 @@ impl Db {
                     Ok(GroupPosition { positions, by_type: FxHashMap::default() })
                 }
                 SpawnLoc::AtPos { pos, offset_direction, group_heading } => {
+                    // place the group beside pos in offset_direction, then push it
+                    // along offset_direction so its closest unit is ~20m from pos
                     let group_center = centroid2d(positions.iter().map(|p| p.position));
                     let radius = distance(
                         group_center,
@@ -552,6 +635,9 @@ impl Db {
                     Ok(GroupPosition { positions, by_type: FxHashMap::default() })
                 }
                 SpawnLoc::AtPosWithComponents { pos, group_heading, component_pos } => {
+                    // units whose type is in component_pos are placed around that
+                    // type's own position (keeping their layout relative to the
+                    // centroid of their type), everything else around pos
                     let group_center = centroid2d(positions.iter().map(|p| p.position));
                     let center_by_typ: FxHashMap<String, Vector2> = {
                         let mut tbl = FxHashMap::default();
@@ -609,6 +695,7 @@ impl Db {
                 }
             }
         }
+        /// Fail if any position is in water
         fn check_water(
             land: &Land,
             positions: &VecDeque<UnitPosition>,
@@ -626,6 +713,7 @@ impl Db {
             }
             Ok(())
         }
+        /// Fail if any position is on land
         fn check_land(
             land: &Land,
             positions: &VecDeque<UnitPosition>,
@@ -659,6 +747,8 @@ impl Db {
         } else {
             String::from(format_compact!("{}-{}", template_name, gid))
         };
+        // naval spawn points are classed as logi, so they count toward the
+        // objective's logi
         let mut spawned = SpawnedGroup {
             id: gid,
             name: group_name.clone(),
@@ -674,6 +764,8 @@ impl Db {
             units: SetS::new(),
             tags: UnitTags(BitFlags::empty()),
         };
+        // first pass, compute the group tags so placement can be validated
+        // before any units are added to the db
         for unit in template.group.units()?.into_iter() {
             let unit = unit?;
             let typ = unit.typ()?;
@@ -722,10 +814,13 @@ impl Db {
             } else {
                 String::from(format_compact!("{}-{}", group_name, uid))
             };
+            // positions were computed in template unit order, so popping in
+            // the same order matches each unit to its position
             let pos = match gpos.by_type.get_mut(&typ) {
                 None => gpos.positions.pop_front().unwrap(),
                 Some(positions) => positions.pop_front().unwrap(),
             };
+            // DCS 3d coordinates are (x, altitude, z), where 2d y maps to z
             let position = {
                 let mut p = Position3::default();
                 p.p.x = pos.position.x;
@@ -800,6 +895,8 @@ impl Db {
         Ok(gid)
     }
 
+    /// [`Db::add_group`], then queue the group to spawn, either immediately or
+    /// at time `delay` if specified.
     pub fn add_and_queue_group<'lua>(
         &mut self,
         spctx: &SpawnCtx,
@@ -827,6 +924,14 @@ impl Db {
         Ok(gid)
     }
 
+    /// Handle a DCS unit birth event.
+    ///
+    /// If the unit is one of ours (found by name) its DCS object id is
+    /// recorded and a stat is published. Otherwise it is a player spawning
+    /// into a slot. Unknown slots are dynamic slots, which are registered
+    /// against the nearest objective (taking its owner's side) and validated
+    /// now, destroying the unit if the player isn't allowed to fly it. A slot
+    /// with no player in it is also destroyed.
     pub(crate) fn unit_born(
         &mut self,
         lua: MizLua,
@@ -933,6 +1038,7 @@ impl Db {
         Ok(BirthRes::OccupiedSlot(slot))
     }
 
+    /// Handle a DCS static birth event, recording the object id of our statics
     pub fn static_born(&mut self, st: &StaticObject) -> Result<()> {
         let id = st.object_id()?;
         let name = st.get_name()?;
@@ -942,6 +1048,13 @@ impl Db {
         Ok(())
     }
 
+    /// Handle a DCS unit death.
+    ///
+    /// Player units are deslotted. Our units are marked dead and reset to
+    /// their spawn position, and their objective's status is updated. When a
+    /// deployed, troop, crate or action group is completely destroyed it is
+    /// deleted, and any player who moved it (or the player who called the
+    /// action, if it has a penalty) loses points.
     pub fn unit_dead(
         &mut self,
         id: &DcsOid<ClassUnit>,
@@ -1035,6 +1148,8 @@ impl Db {
         Ok(())
     }
 
+    /// Handle the death of one of our statics. Like [`Db::unit_dead`], but
+    /// there is no position reset or points penalty.
     pub fn static_dead(
         &mut self,
         id: &DcsOid<ClassStatic>,
@@ -1066,10 +1181,13 @@ impl Db {
         Ok(())
     }
 
+    /// (living units, total units) in the group
     pub fn group_health(&self, gid: &GroupId) -> Result<(usize, usize)> {
         group_health!(self, gid)
     }
 
+    /// `side`'s deployed artillery groups within `artillery_mission_range`
+    /// meters of `pos`
     pub fn artillery_near_point(
         &self,
         side: Side,
@@ -1094,6 +1212,9 @@ impl Db {
         artillery
     }
 
+    /// `side`'s ALCM carrying action groups within `alcm_mission_range`
+    /// meters of `pos`, with the ammo count of the first weapon on the
+    /// group's first unit (0 if it can't be read).
     pub fn alcm_near_point(
         &self,
         side: Side,
@@ -1138,6 +1259,10 @@ impl Db {
         alcm
     }
 
+    /// Update the positions of a slice (about 1/16th) of the units able to
+    /// move, starting at index `last`, to spread the cost over several
+    /// calls. Returns the index to resume from (0 once all units have been
+    /// covered) and the units whose DCS instance no longer exists.
     pub fn update_unit_positions_incremental(
         &mut self,
         lua: MizLua,
@@ -1159,6 +1284,11 @@ impl Db {
         }
     }
 
+    /// Read the current position of each unit in `units` from DCS. Units that
+    /// moved more than 1m are updated, flagged as potentially close to
+    /// enemies, have a position stat published, and their group's mark is
+    /// moved. Returns the object ids of units whose instance is no longer
+    /// valid, so the caller can treat them as dead.
     pub fn update_unit_positions(
         &mut self,
         lua: MizLua,
@@ -1177,6 +1307,7 @@ impl Db {
                     continue;
                 }
             };
+            // reuse the previous Unit handle rather than creating a new one
             let instance = match unit.take() {
                 Some(unit) => unit.change_instance(id),
                 None => Unit::get_instance(lua, id),

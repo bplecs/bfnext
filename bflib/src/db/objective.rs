@@ -14,6 +14,23 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Objectives and territory control.
+//!
+//! An [`Objective`] is a capturable location on the map (airbase, FARP, FOB or
+//! logistics hub). Each objective owns a set of groups per side (defenses,
+//! logistics, services), a trigger [`Zone`], and a [`Warehouse`] that is
+//! synced with the DCS airbase warehouse by the logistics module.
+//!
+//! This module handles:
+//! - classifying objective groups by template name ([`ObjGroupClass`])
+//! - computing objective health / logi from the state of its units
+//! - building player deployed FARPs ([`Db::add_farp`]) and deleting them
+//! - repairing damaged objectives over time
+//! - culling / respawning objective units based on enemy proximity, and
+//!   tracking the "threatened" state
+//! - capture by troops once an objective's logi is destroyed, and the
+//!   map ownership victory condition
+
 use super::{
     Db, Map, MapM, MapS, Set,
     group::{DeployKind, SpawnedUnit},
@@ -60,14 +77,24 @@ use serde_derive::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
 use std::{cmp::max, str::FromStr, sync::Arc};
 
+/// The role of a group belonging to an objective, derived from the prefix of
+/// its template name (see the `From<&str>` impl).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ObjGroupClass {
+    /// Logistics structures. When all logi units are dead the objective
+    /// becomes capturable. FARP pads and naval spawn points are also logi.
     Logi,
+    /// Anti aircraft artillery
     Aaa,
+    /// Long range SAM
     Lr,
+    /// Medium range SAM
     Mr,
+    /// Short range SAM
     Sr,
     Armor,
+    /// Service units (e.g. ammo/fuel trucks). These are always spawned and
+    /// are never culled.
     Services,
     Other,
 }
@@ -96,6 +123,9 @@ impl ObjGroupClass {
     }
 }
 
+/// Classify a template name by its prefix. Prefixes may optionally begin with
+/// a side letter (`B`, `R`, `N`), e.g. `BLOGI`, `RSR`, `AAA`. Anything that
+/// doesn't match a known prefix is [`ObjGroupClass::Other`].
 impl From<&str> for ObjGroupClass {
     fn from(s: &str) -> Self {
         if s.starts_with("BLOGI")
@@ -148,6 +178,8 @@ impl From<&str> for ObjGroupClass {
     }
 }
 
+/// The name of a group placed in an objective's zone in the miz, used to
+/// find the template that should be spawned for each side.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjGroup(String);
 
@@ -169,6 +201,10 @@ impl<'lua> FromLua<'lua> for ObjGroup {
 }
 
 impl ObjGroup {
+    /// Compute the template name and side for this group. Any `-suffix` after
+    /// the last dash is stripped. If the remaining name starts with a side
+    /// letter (`R`, `B`, `N`) that side is used, otherwise `side` is used
+    /// and its letter is prepended to form the template name.
     pub(super) fn template(&self, side: Side) -> (Side, String) {
         let s = match self.0.rsplit_once("-") {
             Some((l, _)) => l,
@@ -191,9 +227,12 @@ impl ObjGroup {
     }
 }
 
+/// The area covered by an objective, taken from its miz trigger zone.
+/// Positions and radii are in meters in DCS map coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Zone {
     Circle { pos: Vector2, radius: f64 },
+    /// A quad zone. `pos` is the zone's reference position.
     Quad { pos: Vector2, points: Quad2 },
 }
 
@@ -207,6 +246,7 @@ impl Default for Zone {
 }
 
 impl Zone {
+    /// Returns true if `pos` is inside the zone.
     pub fn contains(&self, pos: Vector2) -> bool {
         match self {
             Self::Circle {
@@ -225,6 +265,7 @@ impl Zone {
     }
 
     /// returns the radius of the smallest circle that contains the zone
+    /// (for quads, the circle is centered on `pos`)
     pub fn radius(&self) -> f64 {
         match self {
             Self::Circle { radius, .. } => *radius,
@@ -269,36 +310,54 @@ impl Zone {
     }
 }
 
+/// A capturable location on the map. Persisted fields survive restarts;
+/// `#[serde(skip)]` fields are runtime only state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Objective {
     pub id: ObjectiveId,
     pub name: String,
     pub owner: Side,
     pub(super) kind: ObjectiveKind,
+    /// The groups belonging to this objective for each side. Only the
+    /// owner's groups are spawned and count toward health.
     pub(super) groups: MapS<Side, Set<GroupId>>,
+    /// Percentage (0-100) of the owner's non invincible units that are alive
     pub(super) health: u8,
+    /// Percentage (0-100) of the owner's logi units that are alive. When this
+    /// reaches 0 the objective is capturable (and a FARP is deleted).
     pub(super) logi: u8,
+    /// Average percent (0-100) of equipment capacity stored in the warehouse
     #[serde(default)]
     pub(super) supply: u8,
+    /// Average percent (0-100) of liquid capacity stored in the warehouse
     #[serde(default)]
     pub(super) fuel: u8,
+    /// True if enemies are close enough (and, for players, visible) to
+    /// threaten the objective. Cleared after `threatened_cooldown` seconds.
     pub(super) threatened: bool,
     pub(super) last_threatened_ts: DateTime<Utc>,
+    /// When health/logi last changed. Used to time repairs.
     pub(super) last_change_ts: DateTime<Utc>,
     #[serde(default)]
     pub(super) warehouse: Warehouse,
     #[serde(default)]
     pub(super) zone: Zone,
+    /// If true the objective is not supplied by any logistics hub
     #[serde(default)]
     pub(super) logistics_detached: bool,
     #[serde(default)]
     pub points: i32,
+    /// True if the owner's groups are currently spawned in DCS (not culled)
     #[serde(skip)]
     pub(super) spawned: bool,
+    /// Whether the AI of the objective's spawned groups is turned on
     #[serde(skip)]
     pub(super) enabled: bool,
+    /// The last time an enemy was within cull distance. Used to decide
+    /// when to cull the objective's units.
     #[serde(skip)]
     pub(super) last_activate: DateTime<Utc>,
+    /// The 3d position used for line of sight checks against players
     #[serde(skip)]
     pub(super) threat_pos3: Vector3,
 }
@@ -317,6 +376,7 @@ impl Objective {
         self.logi
     }
 
+    /// An objective can be captured by troops once all its logi is destroyed
     pub fn captureable(&self) -> bool {
         self.logi == 0
     }
@@ -339,6 +399,8 @@ impl Objective {
         }
     }
 
+    /// The warehouse inventory of equipment `name`, or an empty inventory
+    /// if the warehouse doesn't track it.
     pub fn get_equipment(&self, name: &str) -> Inventory {
         self.warehouse
             .equipment
@@ -347,6 +409,8 @@ impl Objective {
             .unwrap_or_default()
     }
 
+    /// The warehouse inventory of liquid `name`, or an empty inventory if
+    /// the warehouse doesn't track it.
     pub fn get_liquids(&self, name: &LiquidType) -> Inventory {
         self.warehouse
             .liquids
@@ -367,6 +431,9 @@ impl Db {
 
     /// returns the closest objective that matches the critera to the specified point
     /// (distance, heading from objective to point, objective)
+    ///
+    /// distance is in meters, heading is in radians. Returns None if no
+    /// objective matches `p`.
     pub fn objective_near_point<P: Fn(&Objective) -> bool>(
         obj: &MapM<ObjectiveId, Objective>,
         pos: Vector2,
@@ -389,6 +456,9 @@ impl Db {
         obj.map(|obj| (dist.sqrt(), azumith2d_to(obj.zone.pos(), pos), obj))
     }
 
+    /// Compute (health, logi) percentages for `obj` from its owner's units.
+    /// Invincible units are ignored. Returns (0, 0) if the owner has no
+    /// groups at the objective.
     fn compute_objective_status(&self, obj: &Objective) -> Result<(u8, u8)> {
         obj.groups
             .get(&obj.owner)
@@ -419,6 +489,7 @@ impl Db {
                         }
                     }
                 }
+                // a zero total (or logi_total) yields NaN, which `as u8` casts to 0
                 let health = ((alive as f32 / total as f32) * 100.).trunc() as u8;
                 let logi = ((logi_alive as f32 / logi_total as f32) * 100.).trunc() as u8;
                 Ok((health, logi))
@@ -426,6 +497,9 @@ impl Db {
             .unwrap_or(Ok((0, 0)))
     }
 
+    /// Remove an objective (used for destroyed FARPs) along with all its
+    /// groups, its supply line, slots, markup and airbase mapping. A FARP's
+    /// pad template is returned to the pool so it can be reused.
     pub(super) fn delete_objective(&mut self, oid: &ObjectiveId) -> Result<()> {
         let obj = self
             .persisted
@@ -464,6 +538,14 @@ impl Db {
         Ok(())
     }
 
+    /// Build a player deployed FARP objective at `pos` for `side`.
+    ///
+    /// Takes an unused FARP pad template from the pool (failing if none are
+    /// left), moves the pad to `pos`, and queues the defenses, ammo, fuel and
+    /// barracks components to spawn 60 seconds later. The FARP gets a 2000m
+    /// circular zone, is named after its MGRS UTM zone, is hooked into the
+    /// supply network, and has a resupply from its hub scheduled right away.
+    /// Returns the new objective id.
     pub fn add_farp(
         &mut self,
         lua: MizLua,
@@ -483,6 +565,8 @@ impl Db {
             fuel_template,
             barracks_template,
         } = parts;
+        // all components are placed relative to the centroid of their combined
+        // template units, so the layout between them is preserved
         let location = {
             let mut points: SmallVec<[Vector2; 16]> = smallvec![];
             let defenses = defenses_template
@@ -592,6 +676,7 @@ impl Db {
                 groups.insert_cow(gid);
             }
         }
+        // name is "farp <utm zone> <n>" with the first unused n
         let name = {
             let get_utm_zone = || -> Result<String> {
                 let coord = Coord::singleton(spctx.lua())?;
@@ -674,6 +759,8 @@ impl Db {
         let trs = self
             .deliver_supplies_from_logistics_hubs()
             .context("distributing supplies")?;
+        // inject the transfers into the logistics state machine so the new
+        // farp is stocked without waiting for the next logistics tick
         match &mut self.ephemeral.logistics_stage {
             LogiStage::ExecuteTransfers { transfers } => transfers.extend(trs),
             stage @ (LogiStage::Complete { .. }
@@ -689,6 +776,8 @@ impl Db {
         Ok(oid)
     }
 
+    /// Recompute and store an objective's health and logi, publish the
+    /// stat, and delete the objective if it is a FARP whose logi is gone.
     pub(super) fn update_objective_status(
         &mut self,
         oid: &ObjectiveId,
@@ -719,6 +808,11 @@ impl Db {
         Ok(())
     }
 
+    /// Perform one repair step on an objective: revive every dead unit in the
+    /// single most damaged group of the highest priority class that has
+    /// damage. Priority is Logi, Services, Sr, Aaa, Mr, Lr, Armor, Other.
+    /// The group is respawned if the objective is currently spawned (services
+    /// are always respawned).
     pub fn repair_objective(&mut self, oid: ObjectiveId, now: DateTime<Utc>) -> Result<()> {
         let obj = self
             .persisted
@@ -774,6 +868,20 @@ impl Db {
         Ok(())
     }
 
+    /// Periodic check of every objective against nearby enemy players and
+    /// units, which:
+    /// - spawns the owner's groups when an enemy comes within cull distance
+    ///   (players are also checked at their projected position 30 and 60
+    ///   seconds ahead)
+    /// - culls (despawns) them after `cull_after` seconds without enemies
+    ///   nearby, as long as the objective isn't threatened
+    /// - otherwise toggles the AI of already spawned groups on/off
+    /// - updates the threatened flag. Players threaten only within their type's
+    ///   threatened distance and with line of sight; enemy aircraft within
+    ///   their threat distance; armed enemy ground units within cull distance.
+    ///
+    /// FARP and services groups are never culled or respawned here. Returns
+    /// (objectives that became threatened, objectives that became clear).
     pub fn cull_or_respawn_objectives(
         &mut self,
         lua: MizLua,
@@ -796,8 +904,12 @@ impl Db {
             })
             .collect::<SmallVec<[_; 64]>>();
         let cfg = Arc::clone(&self.ephemeral.cfg);
+        // distances are compared squared to avoid sqrt
         let cull_distance = (cfg.unit_cull_distance as f64).powi(2);
         let ground_cull_distance = (cfg.ground_vehicle_cull_distance as f64).powi(2);
+        // units found near an enemy objective this pass. Used afterward to
+        // prune `units_potentially_close_to_enemies` so units that are no
+        // longer close stop being checked until they move again.
         let mut is_close_to_enemies: FxHashSet<UnitId> = FxHashSet::default();
         let mut check_close_units = |units: &Map<UnitId, SpawnedUnit>,
                                      close_units: &FxHashSet<UnitId>,
@@ -820,6 +932,7 @@ impl Db {
                     let dist = na::distance_squared(&obj.zone.pos().into(), &unit.pos.into());
                     if dist <= cull_dist {
                         *spawn = true;
+                        // unarmed units wake the objective up but don't threaten it
                         if unarmed {
                         } else if air {
                             let threat_dist =
@@ -844,6 +957,8 @@ impl Db {
                 if obj.owner != *side {
                     let threat_dist = (cfg.threatened_distance[typ] as f64).powi(2);
                     let ppos = Vector2::new(pos.x, pos.z);
+                    // spawn ahead of fast movers by projecting their position
+                    // 30 and 60 seconds into the future along their velocity
                     let (future_ppos30, future_ppos60) = {
                         let pos30 = pos.0 + (v * 30.);
                         let pos60 = pos.0 + (v * 60.);
@@ -908,6 +1023,8 @@ impl Db {
                 }
             }
             if !obj.spawned && spawn {
+                // respawn the objective. Units that wandered outside the zone
+                // are reset to their original spawn position.
                 obj.spawned = true;
                 for gid in obj.groups.get(&obj.owner).unwrap_or(&Set::new()) {
                     let group = group!(self, gid)?;
@@ -928,6 +1045,7 @@ impl Db {
                 && !obj.threatened
                 && now - obj.last_activate >= Duration::seconds(cfg.cull_after as i64)
             {
+                // cull the objective. Dead groups have nothing to despawn.
                 obj.spawned = false;
                 for gid in obj.groups.get(&obj.owner).unwrap_or(&Set::new()) {
                     let group = group!(self, gid)?;
@@ -941,6 +1059,7 @@ impl Db {
                                         .push_despawn(*gid, Despawn::Group(oid.clone()))
                                 }
                             }
+                            // statics have no group, despawn each unit by name
                             None => {
                                 for uid in &group.units {
                                     let unit = unit!(self, uid)?;
@@ -952,6 +1071,8 @@ impl Db {
                     }
                 }
             } else if spawn != obj.enabled {
+                // already spawned (or waiting to be culled), so just turn the
+                // AI on while enemies are near and off otherwise to save cpu
                 obj.enabled = spawn;
                 for gid in obj.groups.get(&obj.owner).unwrap_or(&Set::new()) {
                     if let Some(oid) = self.ephemeral.object_id_by_gid.get(gid) {
@@ -977,6 +1098,9 @@ impl Db {
         Ok((became_threatened, became_clear))
     }
 
+    /// Used when `side` captures an objective. Despawns the services groups
+    /// belonging to the other sides, revives `side`'s services groups, and
+    /// schedules them to spawn in 3 minutes.
     pub fn repair_services(
         &mut self,
         side: Side,
@@ -1015,6 +1139,9 @@ impl Db {
         self.update_objective_status(&oid, now)
     }
 
+    /// Revive `1 + n / 2` dead logi units of `side` at the objective, where n
+    /// is the size of the largest logi group, and respawn the logi groups if
+    /// the objective is spawned. Used when an objective is captured.
     pub fn repair_one_logi_step(
         &mut self,
         side: Side,
@@ -1048,6 +1175,9 @@ impl Db {
         self.update_objective_status(&oid, now)
     }
 
+    /// Run a repair step on every damaged objective whose last change was at
+    /// least `repair_time / (logi / 100)` seconds ago, so repairs slow down as
+    /// logi is destroyed. Objectives with 0 logi never self repair.
     pub fn maybe_do_repairs(&mut self, now: DateTime<Utc>) -> Result<()> {
         let to_repair = self
             .persisted
@@ -1056,6 +1186,7 @@ impl Db {
             .filter_map(|(oid, obj)| {
                 let logi = obj.logi as f32 / 100.;
                 let repair_time = self.ephemeral.cfg.repair_time as f32 / logi;
+                // logi 0 makes repair_time infinite (or NaN), which fails this test
                 if repair_time < i64::MAX as f32 {
                     let repair_time = Duration::seconds(repair_time as i64);
                     if obj.health < 100 && (now - obj.last_change_ts) >= repair_time {
@@ -1074,6 +1205,7 @@ impl Db {
         Ok(())
     }
 
+    /// The ids of all objectives that currently have zero logi
     pub fn capturable_objectives(&self) -> SmallVec<[ObjectiveId; 1]> {
         let mut cap = smallvec![];
         for (oid, obj) in &self.persisted.objectives {
@@ -1084,6 +1216,13 @@ impl Db {
         cap
     }
 
+    /// Check the auto reset victory condition, if configured.
+    ///
+    /// When a side first owns at least `fraction` of the objectives (neutral
+    /// objectives count toward both sides) the victory is recorded. Until
+    /// `delay` seconds have passed, a countdown is shown to everyone and None
+    /// is returned; after that the winning side is returned so the caller can
+    /// reset the campaign.
     pub fn check_victory(&mut self, now: DateTime<Utc>) -> Option<Side> {
         self.ephemeral.cfg.auto_reset.and_then(|vc| {
             if let Some((vts, side)) = self.ephemeral.victory {
@@ -1121,6 +1260,19 @@ impl Db {
         })
     }
 
+    /// Check every capturable objective for capturing troops (troops whose
+    /// spec has `can_capture`) inside its zone. If all such troops in a zone
+    /// are from the same side, that side captures the objective:
+    /// - ownership and the DCS airbase coalition are changed
+    /// - some logi and the services are repaired for the new owner
+    /// - the warehouse is converted to the new owner's production and supply
+    ///   lines are recomputed
+    /// - the capturing troops are consumed, and points are split between the
+    ///   players who deployed them (excluding recapturing your own
+    ///   objective with troops picked up from it)
+    ///
+    /// Contested zones are not captured. Returns the (side, objective) pairs
+    /// that were captured.
     pub fn check_capture(
         &mut self,
         lua: MizLua,
@@ -1180,6 +1332,8 @@ impl Db {
                 for gid in obj.groups.get(&obj.owner).unwrap_or(&Set::new()) {
                     to_mark.push(*gid);
                 }
+                // the old owner's surviving units are now enemies of the
+                // objective, so they need to be checked for proximity
                 for gid in obj.groups.get(&obj.owner.opposite()).unwrap_or(&Set::new()) {
                     if let Some(id) = self.ephemeral.group_marks.remove(gid) {
                         self.ephemeral.msgs.delete_mark(id)
@@ -1215,6 +1369,8 @@ impl Db {
                 for (_, ucid, troop_origin, gid) in gids {
                     self.delete_group(&gid)
                         .context("deleting capturing troops")?;
+                    // no credit for "capturing" your own objective with
+                    // troops that were picked up from it
                     if previous_owner != new_owner || troop_origin != Some(oid) {
                         if !ucids.contains(&ucid) {
                             ucids.push(ucid);
@@ -1237,6 +1393,7 @@ impl Db {
                 self.ephemeral.dirty();
             }
         }
+        // push the changed inventories out to every DCS warehouse
         if actually_captured.len() > 0 {
             self.ephemeral.logistics_stage = LogiStage::SyncToWarehouses {
                 objectives: self
@@ -1258,6 +1415,8 @@ impl Db {
         Ok(actually_captured)
     }
 
+    /// Refresh the F10 map markup of all objectives. Mobile (naval) FARPs
+    /// first have their zone moved to the current position of their pad unit.
     pub fn update_objectives_markup(&mut self) -> Result<()> {
         let mut pos_update: SmallVec<[(ObjectiveId, String); 8]> = smallvec![];
         for (id, obj) in &self.persisted.objectives {

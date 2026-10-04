@@ -14,6 +14,16 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Non-persisted campaign state.
+//!
+//! [`Ephemeral`] holds everything the [`super::Db`] needs at runtime that is
+//! not saved to disk: the loaded config and indexes derived from it, the
+//! mapping between campaign ids (units, groups, slots) and live DCS object
+//! ids, which player is in which slot, the spawn/despawn queues, F10 map
+//! markup, the outgoing message queue, and a handle to the background task.
+//! It is rebuilt from the [`Persisted`] state and the miz every time the
+//! mission (re)starts.
+
 use super::{
     cargo::Cargo,
     group::{SpawnedGroup, SpawnedUnit},
@@ -73,47 +83,69 @@ use std::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+/// Static information about a player slot, gathered from the miz at startup
+/// (or at birth time for dynamic slots).
 #[derive(Debug, Clone)]
 pub struct SlotInfo {
     pub unit_name: String,
+    /// the aircraft type of the slot
     pub typ: Vehicle,
+    /// the objective the slot is located in
     pub objective: ObjectiveId,
+    /// true if the slot's route starts with a ground takeoff point
     pub ground_start: bool,
+    /// the miz group id of the slot, used to address F10 menus and messages
     pub miz_gid: miz::GroupId,
     pub side: Side,
 }
 
+/// Per-side lookup tables built from the deployable, crate, and troop config
+/// by [`Ephemeral::set_cfg`].
 #[derive(Debug, Clone, Default)]
 pub(super) struct DeployableIndex {
+    /// deployable name (last element of its menu path) -> deployable
     pub(super) deployables_by_name: FxHashMap<String, Deployable>,
+    /// crate name -> name of the deployable it builds
     pub(super) deployables_by_crates: FxHashMap<String, String>,
+    /// repair crate name -> name of the deployable it repairs
     pub(super) deployables_by_repair: FxHashMap<String, String>,
+    /// every crate (build, repair, and supply transfer) by name
     pub(super) crates_by_name: FxHashMap<String, Crate>,
     pub(super) squads_by_name: FxHashMap<String, Troop>,
+    /// deployable name -> the farp pad templates it may use
     pub(super) pad_templates: FxHashMap<String, FxHashSet<String>>,
 }
 
+/// How much of an item a side produces per production delivery.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Equipment {
     pub(super) production: u32,
 }
 
+/// A side's production, read from its supply source warehouse template.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Production {
     pub(super) equipment: FxHashMap<String, Equipment>,
     pub(super) liquids: FxHashMap<LiquidType, u32>,
 }
 
+/// Runtime state of the campaign that is not persisted. See the module docs.
 #[derive(Debug)]
 pub struct Ephemeral {
+    /// set when persisted state has changed and should be saved
     pub(super) dirty: bool,
     pub cfg: Arc<Cfg>,
+    /// channel to the background thread, None until [`Ephemeral::set_cfg`]
     pub(super) to_bg: Option<UnboundedSender<Task>>,
     pub(super) players_by_slot: IndexMap<SlotId, Ucid, FxBuildHasher>,
+    /// cargo (crates/troops) currently carried by each slot
     pub(super) cargo: FxHashMap<SlotId, Cargo>,
     pub(super) deployable_idx: FxHashMap<Side, Arc<DeployableIndex>>,
+    /// F10 map marks labeling deployed groups
     pub(super) group_marks: FxHashMap<GroupId, MarkId>,
     objective_markup: FxHashMap<ObjectiveId, ObjectiveMarkup>,
+    // bidirectional maps between campaign ids and live DCS object ids. These
+    // only contain entries for things that are currently spawned.
     pub(super) object_id_by_uid: FxHashMap<UnitId, DcsOid<ClassUnit>>,
     pub(super) uid_by_object_id: FxHashMap<DcsOid<ClassUnit>, UnitId>,
     pub(super) object_id_by_slot: FxHashMap<SlotId, DcsOid<ClassUnit>>,
@@ -121,24 +153,39 @@ pub struct Ephemeral {
     pub(super) object_id_by_gid: FxHashMap<GroupId, DcsOid<ClassGroup>>,
     pub(super) gid_by_object_id: FxHashMap<DcsOid<ClassGroup>, GroupId>,
     pub(super) uid_by_static: FxHashMap<DcsOid<ClassStatic>, UnitId>,
+    /// miz group id -> slot, only populated for dynamic slots
     pub(super) slot_by_miz_gid: FxHashMap<miz::GroupId, SlotId>,
+    /// farp objective -> the DCS airbase object of its pad
     pub(super) airbase_by_oid: FxHashMap<ObjectiveId, DcsOid<ClassAirbase>>,
     pub(super) slot_info: FxHashMap<SlotId, SlotInfo>,
+    /// pad templates currently in use by a farp
     used_pad_templates: FxHashSet<String>,
+    /// every pad template name in the config, across both sides
     pub(super) global_pad_templates: FxHashSet<String>,
+    /// players to be moved to spectators, keyed by when it should happen
     force_to_spectators: BTreeMap<DateTime<Utc>, SmallVec<[Ucid; 1]>>,
+    /// spawned units whose position must be polled (driveable units, and
+    /// units on move missions). An IndexSet so position updates can walk it
+    /// incrementally by index.
     pub(super) units_able_to_move: IndexSet<UnitId, FxBuildHasher>,
+    /// groups on a move mission -> their destination
     pub(super) groups_with_move_missions: FxHashMap<GroupId, Vector2>,
+    /// units that moved (or spawned) and need an enemy proximity check
     pub(super) units_potentially_close_to_enemies: FxHashSet<UnitId>,
     pub(super) production_by_side: FxHashMap<Side, Arc<Production>>,
+    /// number of times each action has been used by each side, for limits
     pub(super) actions_taken: FxHashMap<Side, FxHashMap<String, u32>>,
+    /// groups waiting to be pushed onto the spawn queue at a future time
     pub(super) delayspawnq: BTreeMap<DateTime<Utc>, SmallVec<[GroupId; 8]>>,
+    /// next Link 16 STN to assign to an AWACS, counts down from 0o77777
     pub(super) awacs_stn: u32,
     pub(super) logistics_stage: LogiStage,
     spawnq: VecDeque<GroupId>,
     despawnq: VecDeque<(GroupId, Despawn)>,
+    /// (objective, vehicle) pairs whose warehouse inventory must be synced
     sync_warehouse: Vec<(ObjectiveId, Vehicle)>,
     pub(super) msgs: MsgQ,
+    /// set when a side has met the auto reset victory condition
     pub(super) victory: Option<(DateTime<Utc>, Side)>,
 }
 
@@ -184,6 +231,8 @@ impl Default for Ephemeral {
 }
 
 impl Ephemeral {
+    /// Send a task to the background thread. Does nothing if the background
+    /// channel isn't set up yet; panics if the background thread has died.
     fn do_bg(&self, task: Task) {
         if let Some(to_bg) = &self.to_bg {
             match to_bg.send(task) {
@@ -193,6 +242,7 @@ impl Ephemeral {
         }
     }
 
+    /// Publish a stats event via the background thread.
     pub fn stat(&self, stat: Stat) {
         self.do_bg(Task::Stat(stat))
     }
@@ -201,12 +251,15 @@ impl Ephemeral {
         self.slot_info.get(slot)
     }
 
+    /// Look up a slot by its miz group id. Only works for dynamic slots.
     pub fn get_slot_info_by_miz_gid(&self, gid: &miz::GroupId) -> Option<(SlotId, &SlotInfo)> {
         self.slot_by_miz_gid
             .get(gid)
             .and_then(|sl| self.slot_info.get(sl).map(|s| (*sl, s)))
     }
 
+    /// (Re)draw all of an objective's F10 map markup from scratch, deleting
+    /// any existing markup for it first.
     pub fn create_objective_markup(&mut self, persisted: &Persisted, obj: &Objective) {
         if let Some(mk) = self.objective_markup.remove(&obj.id) {
             mk.remove(&mut self.msgs);
@@ -217,6 +270,9 @@ impl Ephemeral {
         );
     }
 
+    /// Incrementally update an objective's markup to reflect its current
+    /// state, creating it if it doesn't exist. `moved` lists objectives whose
+    /// position changed, so supply arrows pointing at them can be moved.
     pub fn update_objective_markup(
         &mut self,
         persisted: &Persisted,
@@ -242,14 +298,19 @@ impl Ephemeral {
         }
     }
 
+    /// Queue the warehouse inventory of `vehicle` at `oid` to be synced.
     pub fn push_sync_warehouse(&mut self, oid: ObjectiveId, vehicle: Vehicle) {
         self.sync_warehouse.push((oid, vehicle));
     }
 
+    /// Take all the pending warehouse syncs, leaving the queue empty.
     pub fn warehouses_to_sync(&mut self) -> Vec<(ObjectiveId, Vehicle)> {
         mem::take(&mut self.sync_warehouse)
     }
 
+    /// Queue a group to be despawned. If a spawn of the same group is still
+    /// queued the two cancel out: the spawn is dropped and the despawn is
+    /// not queued. Duplicate despawns are ignored.
     pub fn push_despawn(&mut self, gid: GroupId, ds: Despawn) {
         let mut queued_spawn = false;
         self.spawnq.retain(|sp_gid| {
@@ -263,6 +324,9 @@ impl Ephemeral {
         }
     }
 
+    /// Queue a group to be spawned. If a despawn of the same group is still
+    /// queued the two cancel out: the despawn is dropped and the spawn is
+    /// not queued. Duplicate spawns are ignored.
     pub fn push_spawn(&mut self, gid: GroupId) {
         let mut queued_despawn = false;
         self.despawnq.retain(|(ds_gid, _)| {
@@ -279,6 +343,13 @@ impl Ephemeral {
         self.spawnq.len()
     }
 
+    /// Do one increment of spawn queue work. Called repeatedly from the main
+    /// loop to spread spawning out over many frames.
+    ///
+    /// First moves any delayed spawns that are due onto the spawn queue. Then,
+    /// if there are pending despawns, processes 1/16th of them (at least 1);
+    /// otherwise processes 1/16th (at least 1) of the pending spawns.
+    /// Despawns always take priority over spawns.
     pub fn process_spawn_queue(
         &mut self,
         perf: &mut PerfInner,
@@ -307,6 +378,7 @@ impl Ephemeral {
         if dlen > 0 {
             for _ in 0..max(1, dlen >> 4) {
                 if let Some((gid, despawn)) = self.despawnq.pop_front() {
+                    // forget the live object ids before the group goes away
                     if let Some(group) = persisted.groups.get(&gid) {
                         if let Some(id) = self.object_id_by_gid.remove(&gid) {
                             self.gid_by_object_id.remove(&id);
@@ -333,6 +405,9 @@ impl Ephemeral {
         Ok(())
     }
 
+    /// Reserve an unused pad template for the deployable `name` on `side`.
+    /// Returns None if the deployable has no pad templates or all of them
+    /// are in use. Release it with [`Ephemeral::return_pad_template`].
     pub fn take_pad_template(&mut self, side: Side, name: &String) -> Option<String> {
         self.deployable_idx.get(&side).and_then(|idx| {
             if let Some(templates) = idx.pad_templates.get(name) {
@@ -350,6 +425,7 @@ impl Ephemeral {
         self.used_pad_templates.remove(pad);
     }
 
+    /// Mark a pad template as in use, e.g. by a farp restored after a restart.
     pub fn set_pad_template_used(&mut self, pad: String) {
         self.used_pad_templates.insert(pad);
     }
@@ -374,6 +450,14 @@ impl Ephemeral {
         self.object_id_by_slot.get(id)
     }
 
+    /// Build the [`DeployableIndex`] for `side` and validate the deployable
+    /// config against the miz.
+    ///
+    /// Fails if a referenced template is missing from the miz, if names
+    /// collide (deployables, crates, repair crates, pad templates), if a
+    /// crate is used both as a build crate and a repair crate, if something
+    /// costs points while the points system is disabled (`points` false), or
+    /// if an objective deployable has fewer pad templates than its limit.
     fn index_deployables_for_side(
         &mut self,
         miz: &Miz,
@@ -385,6 +469,7 @@ impl Ephemeral {
         deployables: &[Deployable],
     ) -> Result<()> {
         let idx = Arc::make_mut(self.deployable_idx.entry(side).or_default());
+        // the side's base (objective) repair crate
         idx.crates_by_name
             .insert(repair_crate.name.clone(), repair_crate);
         if let Some(whcfg) = whcfg.as_ref() {
@@ -522,16 +607,20 @@ impl Ephemeral {
         Ok(())
     }
 
+    /// Flag that persisted state changed and needs to be saved.
     pub fn dirty(&mut self) {
         self.dirty = true
     }
 
+    /// Return whether state is dirty and clear the flag.
     pub(super) fn take_dirty(&mut self) -> bool {
         let cur = self.dirty;
         self.dirty = false;
         cur
     }
 
+    /// Get the live DCS unit occupying `slot`. Fails if the slot's unit is
+    /// not currently in the mission.
     pub fn slot_instance_unit<'lua>(&self, lua: MizLua<'lua>, slot: &SlotId) -> Result<Unit<'lua>> {
         self.object_id_by_slot
             .get(slot)
@@ -551,6 +640,8 @@ impl Ephemeral {
         self.slot_instance_unit(lua, slot)?.get_position()
     }
 
+    /// Remove and return all pending force-to-spectators entries scheduled
+    /// strictly before `now`. Later entries are kept.
     pub fn players_to_force_to_spectators<'a>(
         &'a mut self,
         now: DateTime<Utc>,
@@ -559,6 +650,7 @@ impl Ephemeral {
         mem::replace(&mut self.force_to_spectators, keep)
     }
 
+    /// Remove every pending force-to-spectators entry for `ucid`.
     pub fn cancel_force_to_spectators(&mut self, ucid: &Ucid) {
         info!("canceling force to spectators for {ucid}");
         self.force_to_spectators.retain(|_, ids| {
@@ -567,6 +659,7 @@ impl Ephemeral {
         })
     }
 
+    /// Queue `ucid` to be moved to spectators as soon as possible.
     pub fn force_player_to_spectators(&mut self, ucid: &Ucid) {
         self.force_to_spectators
             .entry(Utc::now())
@@ -574,6 +667,7 @@ impl Ephemeral {
             .push(ucid.clone())
     }
 
+    /// Queue `ucid` to be moved to spectators at time `ts`.
     pub fn force_player_to_spectators_at(&mut self, ucid: &Ucid, ts: DateTime<Utc>) {
         self.force_to_spectators
             .entry(ts)
@@ -581,6 +675,15 @@ impl Ephemeral {
             .push(ucid.clone())
     }
 
+    /// Remove the player from `slot` and clean up the slot's object id
+    /// mappings and cargo.
+    ///
+    /// Unless the player is in the middle of changing slots or moving to
+    /// jtac/spectators, they are queued to be forced to spectators. If
+    /// `expected_ucid` is given and doesn't match the slot's occupant an
+    /// error is logged (the occupant is still removed). Returns the unit id
+    /// and ucid, or None if no player was in the slot or the slot's unit id
+    /// is unknown.
     pub(super) fn player_deslot(
         &mut self,
         per: &Persisted,
@@ -617,6 +720,9 @@ impl Ephemeral {
         None
     }
 
+    /// Forget a unit that died. If it was a player slot the player is
+    /// deslotted (see [`Ephemeral::player_deslot`]). Returns the unit id and,
+    /// for players, their ucid. Returns None if the object id is unknown.
     pub(super) fn unit_dead(
         &mut self,
         per: &Persisted,
@@ -653,6 +759,8 @@ impl Ephemeral {
             .and_then(|slot| self.players_by_slot.get(slot))
     }
 
+    /// Show a message panel for `duration` seconds to the group of the slot
+    /// the player currently occupies. Does nothing if they aren't in a slot.
     pub fn panel_to_player<S: Into<String>>(
         &mut self,
         persisted: &Persisted,
@@ -672,6 +780,14 @@ impl Ephemeral {
         }
     }
 
+    /// Install the campaign config and background channel, validating the
+    /// config against the miz and building the per-side indexes.
+    ///
+    /// Fails if any unit type in the miz is missing from
+    /// `unit_classification`, if the auto reset fraction is outside [0, 1],
+    /// if any template referenced by crates, deployables, troops, or actions
+    /// is missing from the miz, if something costs points while the points
+    /// system is disabled, or if any deployable index check fails.
     pub(super) fn set_cfg(
         &mut self,
         miz: &Miz,
@@ -825,6 +941,15 @@ impl Ephemeral {
         Ok(())
     }
 
+    /// Spawn a persisted group into DCS from its miz template.
+    ///
+    /// The template is deep cloned, made visible and active, and renamed to
+    /// the group's name. Template units with no living persisted counterpart
+    /// are removed; the rest get their persisted position, altitude,
+    /// heading, and name. AWACS units are assigned the next Link 16 STN. If
+    /// `mission` is non-empty it replaces the template's route.
+    ///
+    /// Returns None (spawning nothing) if every unit is dead.
     pub(super) fn spawn_group<'lua>(
         &mut self,
         perf: &mut PerfInner,
@@ -871,6 +996,8 @@ impl Ephemeral {
             .collect();
         let alive = {
             let units = template.group.units().context("getting units")?;
+            // lua arrays are 1 indexed, and i only advances when a unit is
+            // kept because removing one shifts the rest down
             let mut i = 1;
             while i as usize <= units.len() {
                 let unit = units.get(i)?;
@@ -884,6 +1011,7 @@ impl Ephemeral {
                                 props.raw_set("STN_L16", stn)?;
                             }
                         }
+                        // let DCS assign a fresh unit id
                         unit.raw_remove("unitId")?;
                         unit.set_pos(su.pos)?;
                         unit.set_alt(su.position.p.y)?;
@@ -899,6 +1027,7 @@ impl Ephemeral {
             record_perf(&mut perf.spawn, ts);
             Ok(None)
         } else {
+            // the centroid includes dead units' positions
             let point = centroid2d(points.iter().map(|p| *p));
             template.group.set_pos(point)?;
             /*

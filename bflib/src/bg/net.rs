@@ -1,3 +1,13 @@
+//! Stale, uncompiled predecessor of [`super::perf`].
+//!
+//! NOTE: this file is not declared as a module in `bg/mod.rs` (there is no
+//! `mod net;`), so it is not part of the build. It is an earlier copy of the
+//! perf publishing code now in `perf.rs`: a [`PubPerf`] that publishes the
+//! bflib and DCS API perf histograms to netidx. It has drifted from the
+//! current types (e.g. it lacks `logistics_transfer`, so the exhaustive
+//! `PerfStat` destructuring would no longer compile) and carries unused
+//! imports. Prefer `perf.rs`.
+
 use super::logpub::LogPublisher;
 use anyhow::Result;
 use bfprotocols::perf::PerfStat;
@@ -9,7 +19,10 @@ use netidx::{
 };
 use std::path::PathBuf;
 
+/// The published summary of one histogram, at `<base>/<name>/{unit, n,
+/// mean, 25th, 50th, 90th, 99th, 99.9th}`.
 struct PubHistStat {
+    /// Published once at creation and never updated.
     unit: Val,
     n: Val,
     mean: Val,
@@ -67,6 +80,9 @@ impl PubHistStat {
     }
 }
 
+/// Published values for every bflib and DCS API perf histogram. Unlike the
+/// version in `perf.rs`, histograms are published directly under `base`
+/// rather than `base/perf`.
 struct PubPerf {
     players: Val,
     logistics_items: Val,

@@ -14,6 +14,23 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! F10 "JTAC" radio menu.
+//!
+//! Gives players control of their side's JTACs (see [`crate::jtac`]): status
+//! reports, target shifting, filters, laser codes, smoke, IR pointer, and
+//! calling in artillery, ALCM and bomber missions on the JTAC's target.
+//!
+//! DCS radio menus are limited in size and expensive to build, so the menu is
+//! built lazily. [`init_jtac_menu_for_slot`] installs only a top-level
+//! "JTAC>>" command; selecting it runs [`add_jtac_locations`], which builds a
+//! "JTAC" submenu listing pinned JTACs directly and every other JTAC grouped
+//! by nearest objective ("<objective>>>"). Selecting an objective expands it
+//! via [`add_jtacs_by_location`] and subscribes the slot to that objective,
+//! so the menu is rebuilt when JTACs there change (handled in `lib.rs`).
+//!
+//! Most handlers announce the result to the JTAC's whole side; failures of
+//! player-requested missions are usually sent only to the requesting player.
+
 use super::{ArgQuad, ArgTriple, ArgTuple};
 use crate::{
     Context,
@@ -44,6 +61,8 @@ use log::error;
 use smallvec::{SmallVec, smallvec};
 use std::sync::Arc;
 
+/// Show the status of JTAC `arg.snd`. If `arg.fst` is a player the report is
+/// sent only to them, if `None` it is broadcast to the JTAC's side.
 pub fn jtac_status(_: MizLua, arg: ArgTuple<Option<Ucid>, JtId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let jtac = ctx
@@ -67,6 +86,8 @@ pub fn jtac_status(_: MizLua, arg: ArgTuple<Option<Ucid>, JtId>) -> Result<()> {
     Ok(())
 }
 
+/// Return (name of the objective nearest the JTAC, name of player `ucid`) for
+/// use in announcements, substituting "unknown" for either if missing.
 fn change_info(jtac: &Jtac, db: &Db, ucid: &Ucid) -> (String, String) {
     let near = db
         .objective(&jtac.location().oid)
@@ -91,6 +112,7 @@ fn get_jtac<'a>(jtacs: &'a Jtacs, id: &JtId) -> Result<&'a Jtac> {
         .with_context(|| format_compact!("get jtac {}", id))
 }
 
+/// Announce the JTAC's new auto shift state to its side.
 fn jtac_msg_auto_shift(db: &mut Db, jtid: JtId, jtac: &Jtac, ucid: &Ucid) {
     let (near, name) = change_info(jtac, db, ucid);
     let msg = format_compact!(
@@ -105,6 +127,7 @@ fn jtac_msg_auto_shift(db: &mut Db, jtid: JtId, jtac: &Jtac, ucid: &Ucid) {
         .panel_to_side(10, false, jtac.side(), msg);
 }
 
+/// Toggle automatic target selection for JTAC `arg.snd`, requested by `arg.fst`.
 pub fn jtac_toggle_auto_shift(lua: MizLua, arg: ArgTuple<Ucid, JtId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let jtac = get_jtac_mut(&mut ctx.jtac, &arg.snd)?;
@@ -114,6 +137,7 @@ pub fn jtac_toggle_auto_shift(lua: MizLua, arg: ArgTuple<Ucid, JtId>) -> Result<
     Ok(())
 }
 
+/// Toggle the IR pointer (in addition to the laser) for JTAC `arg.snd`.
 pub fn jtac_toggle_ir_pointer(lua: MizLua, arg: ArgTuple<Ucid, JtId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let jtac = get_jtac_mut(&mut ctx.jtac, &arg.snd)?;
@@ -134,6 +158,8 @@ pub fn jtac_toggle_ir_pointer(lua: MizLua, arg: ArgTuple<Ucid, JtId>) -> Result<
     Ok(())
 }
 
+/// Drop smoke on JTAC `arg.snd`'s current target. Failures (e.g. smoke still
+/// on cooldown) are announced to the side rather than returned as errors.
 pub fn jtac_smoke_target(lua: MizLua, arg: ArgTuple<Ucid, JtId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let jtac = get_jtac_mut(&mut ctx.jtac, &arg.snd)?;
@@ -154,6 +180,7 @@ pub fn jtac_smoke_target(lua: MizLua, arg: ArgTuple<Ucid, JtId>) -> Result<()> {
     Ok(())
 }
 
+/// Announce the JTAC's new target after a manual shift.
 fn jtac_msg_shift(db: &mut Db, jtid: JtId, jtac: &Jtac, ucid: &Ucid) {
     let (near, name) = change_info(jtac, db, ucid);
     let target = jtac
@@ -173,6 +200,7 @@ fn jtac_msg_shift(db: &mut Db, jtid: JtId, jtac: &Jtac, ucid: &Ucid) {
         .panel_to_side(10, false, jtac.side(), msg);
 }
 
+/// Move JTAC `arg.snd` to its next contact. This disables auto shift.
 pub fn jtac_shift(lua: MizLua, arg: ArgTuple<Ucid, JtId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let jtac = get_jtac_mut(&mut ctx.jtac, &arg.snd)?;
@@ -181,6 +209,8 @@ pub fn jtac_shift(lua: MizLua, arg: ArgTuple<Ucid, JtId>) -> Result<()> {
     Ok(())
 }
 
+/// Order artillery group `arg.snd` to fire `arg.trd` rounds at the target of
+/// JTAC `arg.fst`. Requested by player `arg.fth`, who alone is told of failures.
 pub fn jtac_artillery_mission(lua: MizLua, arg: ArgQuad<JtId, DbGid, u8, Ucid>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     match ctx
@@ -212,6 +242,8 @@ pub fn jtac_artillery_mission(lua: MizLua, arg: ArgQuad<JtId, DbGid, u8, Ucid>) 
     Ok(())
 }
 
+/// Order artillery group `arg.snd` to fire all its remaining rounds at the
+/// target of JTAC `arg.fst`. Requested by player `arg.trd`.
 pub fn jtac_artillery_fire_all(lua: MizLua, arg: ArgTriple<JtId, DbGid, Ucid>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     match ctx
@@ -243,6 +275,8 @@ pub fn jtac_artillery_fire_all(lua: MizLua, arg: ArgTriple<JtId, DbGid, Ucid>) -
     Ok(())
 }
 
+/// Report the total rounds remaining in artillery group `arg.snd` to player
+/// `arg.trd`. The JTAC id `arg.fst` is unused.
 pub fn jtac_get_artillery_ammo(lua: MizLua, arg: ArgTriple<JtId, DbGid, Ucid>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     match ctx
@@ -264,9 +298,14 @@ pub fn jtac_get_artillery_ammo(lua: MizLua, arg: ArgTriple<JtId, DbGid, Ucid>) -
     Ok(())
 }
 
+/// Order artillery group `arg.snd` to spread fire across several of JTAC
+/// `arg.fst`'s contacts. `arg.trd` is `[rounds_per_target, num_targets]` and
+/// must have two elements (panics otherwise). Success and failure are both
+/// announced to the side.
 pub fn jtac_artillery_combo_mission(lua: MizLua, arg: ArgQuad<JtId, DbGid, Vec<u8>, Ucid>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let mut params = arg.trd;
+    // popped in reverse order of the menu's vec![rounds_per_target, num_targets]
     let num_targets = params.pop().unwrap();
     let rounds_per_target = params.pop().unwrap();
     match ctx
@@ -296,6 +335,10 @@ pub fn jtac_artillery_combo_mission(lua: MizLua, arg: ArgQuad<JtId, DbGid, Vec<u
     Ok(())
 }
 
+/// Order ALCM (air launched cruise missile) group `arg.snd` to strike JTAC
+/// `arg.fst`'s contacts. `arg.trd` is `[magazine_fraction, per_target]` where
+/// magazine_fraction is 1/2/4 for quarter/half/all and per_target is 1/2/4
+/// missiles per contact; see [`Jtac::alcm_mission`].
 pub fn jtac_alcm_mission(lua: MizLua, arg: ArgQuad<JtId, DbGid, Vec<u8>, Ucid>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     match ctx
@@ -327,6 +370,8 @@ pub fn jtac_alcm_mission(lua: MizLua, arg: ArgQuad<JtId, DbGid, Vec<u8>, Ucid>) 
     Ok(())
 }
 
+/// Task group `arg.snd` to directly attack JTAC `arg.fst`'s current target
+/// unit (rather than firing at a point). Requested by player `arg.trd`.
 fn jtac_relay_target(lua: MizLua, arg: ArgTriple<JtId, DbGid, Ucid>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let jtac = get_jtac_mut(&mut ctx.jtac, &arg.fst)?;
@@ -355,6 +400,7 @@ fn jtac_relay_target(lua: MizLua, arg: ArgTriple<JtId, DbGid, Ucid>) -> Result<(
     Ok(())
 }
 
+/// Remove all unit tag filters from JTAC `arg.snd`.
 fn jtac_clear_filter(lua: MizLua, arg: ArgTuple<Ucid, JtId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let jtac = get_jtac_mut(&mut ctx.jtac, &arg.snd)?;
@@ -374,6 +420,9 @@ fn jtac_clear_filter(lua: MizLua, arg: ArgTuple<Ucid, JtId>) -> Result<()> {
     Ok(())
 }
 
+/// Add the unit tags encoded in `arg.snd` (raw [`UnitTag`] bits) to JTAC
+/// `arg.fst`'s filter. Filters accumulate: a contact must carry every tag in
+/// the filter to remain a contact.
 fn jtac_filter(lua: MizLua, arg: ArgTriple<JtId, u64, Ucid>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let filter =
@@ -396,6 +445,9 @@ fn jtac_filter(lua: MizLua, arg: ArgTriple<JtId, u64, Ucid>) -> Result<()> {
     Ok(())
 }
 
+/// Set one digit of JTAC `arg.fst`'s laser code. `arg.snd` is the digit
+/// scaled to its position (e.g. 600 sets the hundreds digit to 6); see
+/// [`Jtacs::set_code_part`].
 pub fn jtac_set_code(lua: MizLua, arg: ArgTriple<JtId, u16, Ucid>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     ctx.jtac
@@ -417,6 +469,10 @@ pub fn jtac_set_code(lua: MizLua, arg: ArgTriple<JtId, u16, Ucid>) -> Result<()>
     Ok(())
 }
 
+/// Add an "Artillery" submenu under `root` with, for each artillery group in
+/// range of the JTAC's target, commands to relay the target, report ammo, and
+/// fire single, fire-for-effect, fire-all and multi-target ("Target Group")
+/// missions.
 fn add_artillery_menu_for_jtac(
     lua: MizLua,
     mizgid: GroupId,
@@ -553,6 +609,9 @@ fn add_artillery_menu_for_jtac(
     Ok(())
 }
 
+/// Add an "ALCM" submenu under `root` with, for each nearby ALCM group
+/// (labelled with its missile count), Fire Quarter/Half/All submenus each
+/// offering one, two or four missiles per target.
 fn add_alcm_menu_for_jtac(
     lua: MizLua,
     mizgid: GroupId,
@@ -576,6 +635,7 @@ fn add_alcm_menu_for_jtac(
         let half = mc.add_submenu_for_group(mizgid, "Fire Half".into(), Some(root.clone()))?;
         let all = mc.add_submenu_for_group(mizgid, "Fire All".into(), Some(root.clone()))?;
 
+        // n is the magazine fraction code understood by Jtac::alcm_mission
         for (submenu, n) in vec![(quarter, 1), (half, 2), (all, 4)] {
             mc.add_command_for_group(
                 mizgid,
@@ -619,6 +679,9 @@ fn add_alcm_menu_for_jtac(
     Ok(())
 }
 
+/// Start the bomber action named `arg.trd` against JTAC `arg.fst`'s target on
+/// behalf of player `arg.snd`. Errors if the action doesn't exist for the
+/// JTAC's side or isn't a bomber action; start failures go to the player.
 pub fn call_bomber(lua: MizLua, arg: ArgTriple<JtId, Ucid, String>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let perf = Arc::make_mut(&mut unsafe { Perf::get_mut() }.inner);
@@ -673,6 +736,8 @@ pub fn call_bomber(lua: MizLua, arg: ArgTriple<JtId, Ucid, String>) -> Result<()
     Ok(())
 }
 
+/// Pin or unpin JTAC `arg.snd` for slot `arg.fst` and rebuild the slot's menu.
+/// Pinned JTACs are listed directly at the top of the JTAC menu.
 fn toggle_pin_jtac(lua: MizLua, arg: ArgTuple<SlotId, JtId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let subd = ctx.subscribed_jtac_menus.entry(arg.fst).or_default();
@@ -684,6 +749,13 @@ fn toggle_pin_jtac(lua: MizLua, arg: ArgTuple<SlotId, JtId>) -> Result<()> {
     init_jtac_menu_for_slot(ctx, lua, &arg.fst)
 }
 
+/// Add the full control submenu for a single JTAC under `root`, for player
+/// `ucid` in `slot` (miz group `mizgid`).
+///
+/// The submenu is labelled with the JTAC id plus what it is (action name,
+/// deployable/troop type and owner, or aircraft type and player for slot
+/// JTACs) and contains pin, status, auto shift, IR pointer, smoke, shift,
+/// filter, laser code, artillery, ALCM and bomber mission commands.
 pub(super) fn add_menu_for_jtac(
     db: &Db,
     side: Side,
@@ -813,6 +885,8 @@ pub(super) fn add_menu_for_jtac(
             snd: jtac.gid(),
         },
     )?;
+    // dcs limits the number of items per menu, so page the tags into
+    // nested "Next>>" submenus
     for (i, tag) in UnitTag::all().iter().enumerate() {
         if (i + 1) % 9 == 0 {
             filter_root =
@@ -835,6 +909,7 @@ pub(super) fn add_menu_for_jtac(
         mc.add_submenu_for_group(mizgid, "Hundreds".into(), Some(code_root.clone()))?;
     let tens_root = mc.add_submenu_for_group(mizgid, "Tens".into(), Some(code_root.clone()))?;
     let ones_root = mc.add_submenu_for_group(mizgid, "Ones".into(), Some(code_root.clone()))?;
+    // the thousands digit is always 1, so only the lower three are settable
     for (scale, root) in [(100, &hundreds_root), (10, &tens_root), (1, &ones_root)] {
         let range = if scale == 100 { 0..=6 } else { 0..=8 };
         for n in range {
@@ -897,6 +972,12 @@ pub(super) fn add_menu_for_jtac(
     Ok(())
 }
 
+/// Menu handler: expand the "<objective>>>" placeholder command (`arg.fth` is
+/// its parent menu) into a submenu of all of player `arg.fst`'s side's JTACs
+/// near objective `arg.trd`, paging every 8 entries with "NEXT>>".
+///
+/// Also subscribes the player's slot to that objective so the menu will be
+/// rebuilt when the JTACs there change.
 fn add_jtacs_by_location(
     lua: MizLua,
     arg: ArgQuad<Ucid, GroupId, ObjectiveId, GroupSubMenu>,
@@ -944,6 +1025,7 @@ fn add_jtacs_by_location(
     Ok(())
 }
 
+/// Menu handler: reset the player's JTAC menu back to the lazy "JTAC>>" entry.
 fn jtac_refresh_locations(lua: MizLua, arg: Ucid) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let player = ctx
@@ -957,6 +1039,11 @@ fn jtac_refresh_locations(lua: MizLua, arg: Ucid) -> Result<()> {
     Ok(())
 }
 
+/// Menu handler: replace the "JTAC>>" placeholder with the "JTAC" submenu.
+///
+/// Pinned JTACs of the player's side are listed first with their full menus;
+/// the remaining JTACs are represented by one lazy "<objective>>>" command per
+/// nearby objective, sorted by objective name. Paged every 8 entries.
 fn add_jtac_locations(lua: MizLua, arg: ArgTriple<Ucid, GroupId, SlotId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let slot = arg.trd;
@@ -976,6 +1063,8 @@ fn add_jtac_locations(lua: MizLua, arg: ArgTriple<Ucid, GroupId, SlotId>) -> Res
         arg.fst,
     )?;
     let mut n = 0;
+    // count entries in the current page, starting a nested "NEXT>>" submenu
+    // once it is full
     macro_rules! handle_submenu {
         () => {
             if n >= 8 {
@@ -1020,6 +1109,7 @@ fn add_jtac_locations(lua: MizLua, arg: ArgTriple<Ucid, GroupId, SlotId>) -> Res
             pinned,
         })
     }));
+    // pinned first, then alphabetically by nearest objective
     jtacs.sort_by(|jte0, jte1| {
         use std::cmp::Ordering;
         match jte1.pinned.cmp(&jte0.pinned) {
@@ -1060,6 +1150,9 @@ fn add_jtac_locations(lua: MizLua, arg: ArgTriple<Ucid, GroupId, SlotId>) -> Res
     Ok(())
 }
 
+/// (Re)initialize the JTAC menu for `slot`, removing any existing "JTAC"
+/// submenu and installing the lazy top-level "JTAC>>" command. Does nothing
+/// if no player is in the slot; errors if the slot has no slot info.
 pub(crate) fn init_jtac_menu_for_slot(ctx: &mut Context, lua: MizLua, slot: &SlotId) -> Result<()> {
     let ucid = match ctx.db.ephemeral.player_in_slot(slot) {
         Some(ucid) => ucid,

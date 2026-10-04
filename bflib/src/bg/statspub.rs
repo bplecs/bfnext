@@ -1,3 +1,14 @@
+//! Record and publish campaign stats with netidx-archive.
+//!
+//! Stat events ([`Stat`]: connects, slots, kills, round start/end,
+//! inventory, ...) are JSON encoded and appended as string updates of the
+//! single archive path [`PATH`] (`/stats`) to an archive in
+//! `<writedir>/Logs/stats`. A netidx-archive [`Recorder`] publishes that
+//! archive for playback under `<base>` (i.e. `<netidx_base>/<sortie>/stats`)
+//! so consumers such as bfdb can read the stats history. The recorder is
+//! not used to record anything from netidx itself (its record spec is
+//! empty); we take its shard writer and write to it directly.
+
 use anyhow::{Context, Result, anyhow};
 use arcstr::ArcStr;
 use bfprotocols::stats::{PATH, Stat};
@@ -21,13 +32,22 @@ use tokio::task;
 
 use super::encode;
 
+/// Writer for the stats archive.
 pub(super) struct Statspub {
+    /// Archive id of the [`PATH`] path.
     id: Id,
+    /// The writer for shard "0", taken from the recorder.
     log: ArchiveCollectionWriter,
+    /// Kept alive so the archive stays published.
     _recorder: Recorder,
 }
 
 impl Statspub {
+    /// Start the recorder on `write_dir` publishing under `base`.
+    ///
+    /// If the existing current archive file has more than 4096 bytes in it,
+    /// it is rotated and compressed first, so each session starts a fresh
+    /// current file. Registers [`PATH`] in the archive if it isn't there yet.
     pub(super) async fn new(
         publisher: Publisher,
         cfg: &Config,
@@ -95,6 +115,10 @@ impl Statspub {
     }
 
     /// This will not block
+    ///
+    /// Append `stat`, JSON encoded, to the archive with timestamp `ts`. The
+    /// write is wrapped in `block_in_place` so it doesn't stall other tasks
+    /// on the runtime. Data isn't guaranteed on disk until [`Self::flush`].
     pub(super) fn append(&mut self, ts: DateTime<Utc>, stat: &Stat) -> Result<()> {
         task::block_in_place(|| {
             let mut batch = BATCH_POOL.take();
@@ -105,6 +129,9 @@ impl Statspub {
     }
 
     /// Flush the log
+    ///
+    /// Called on every state save and at shutdown. This blocks, callers wrap
+    /// it in `block_in_place`.
     pub(super) fn flush(&mut self) -> Result<()> {
         self.log.flush_current()
     }

@@ -1,3 +1,16 @@
+//! Netidx RPC interface for remote administration.
+//!
+//! Each RPC published under `<netidx_base>/<sortie>/api/<name>` mirrors an
+//! in game admin command. RPC handlers run on the background tokio runtime
+//! and can't touch the campaign state, so each one just builds an
+//! [`AdminCommand`] and pushes it, paired with a oneshot reply channel, onto
+//! a shared queue. The game thread drains that queue in
+//! `admin::run_admin_commands`, executes the command, and sends the result
+//! back over the oneshot, which [`wait_task`] forwards to the RPC caller.
+//!
+//! Arguments that fail to parse (side names, regexes, warehouse kinds) are
+//! rejected immediately with an error reply without touching the queue.
+
 use crate::admin::{AdminCommand, WarehouseKind};
 use anyhow::Result;
 use arcstr::ArcStr;
@@ -20,6 +33,8 @@ use regex::Regex;
 use std::{str::FromStr, sync::Arc};
 use tokio::{sync::oneshot, task};
 
+/// The published admin RPC procedures. The fields are never read, they are
+/// held only so the procs stay published; dropping this unpublishes them.
 pub struct Rpcs {
     _reduce_inventory: Proc,
     _transfer_supply: Proc,
@@ -48,6 +63,12 @@ pub struct Rpcs {
     _shutdown: Proc,
 }
 
+/// Wait for the game thread to answer each queued call and send the answer
+/// to the caller. If the oneshot sender is dropped without a reply the
+/// caller gets a "call failed" error.
+///
+/// Calls are awaited one at a time in submission order, so a slow command
+/// delays the replies of the calls queued behind it.
 async fn wait_task(mut ch: mpsc::Receiver<(RpcCall, oneshot::Receiver<Value>)>) {
     while let Some((mut c, ch)) = ch.next().await {
         match ch.await {
@@ -58,12 +79,17 @@ async fn wait_task(mut ch: mpsc::Receiver<(RpcCall, oneshot::Receiver<Value>)>) 
 }
 
 impl Rpcs {
+    /// Publish all admin RPCs under `base/api`, pushing commands onto `q`.
+    /// Spawns [`wait_task`] to deliver replies. Fails if any proc can't be
+    /// published.
     pub async fn new(
         publisher: &Publisher,
         q: &Arc<SegQueue<(AdminCommand, oneshot::Sender<Value>)>>,
         base: &Path,
     ) -> Result<Self> {
         let base = base.append("api");
+        // every proc hands its (call, reply receiver) pair to wait_task via
+        // this channel; the handler returning Some(..) defers the reply
         let (wait, rx) = mpsc::channel(10);
         task::spawn(wait_task(rx));
         let _q = Arc::clone(&q);

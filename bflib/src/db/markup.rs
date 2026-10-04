@@ -14,6 +14,18 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! F10 map markup for objectives.
+//!
+//! Each objective is drawn on the F10 map as an owner colored ring (circle
+//! or quad matching its zone), a yellow "threatened" ring that is visible
+//! only while enemies are near, a white "capturable" ring visible once its
+//! logistics are destroyed, and a text label with its status. Logistics
+//! hubs also get gray arrows to the objectives they supply. All drawing is
+//! queued on the [`MsgQ`] and sent to DCS incrementally.
+//!
+//! Rings are hidden by setting their alpha to 0 rather than deleting them,
+//! so updates only need to change colors, text, and positions.
+
 use super::{
     objective::{Objective, Zone},
     persisted::Persisted,
@@ -31,6 +43,9 @@ use dcso3::{
 };
 use fxhash::FxHashMap;
 
+/// The markup drawn for one objective, along with the objective state it
+/// was last drawn with so [`ObjectiveMarkup::update`] can send only changes.
+/// Mark ids are freshly allocated by `Default`.
 #[derive(Debug, Clone, Default)]
 pub(super) struct ObjectiveMarkup {
     side: Side,
@@ -40,15 +55,18 @@ pub(super) struct ObjectiveMarkup {
     supply: u8,
     fuel: u8,
     points: i32,
+    /// display name, "<objective name> <kind>"
     name: String,
     owner_ring: MarkId,
     capturable_ring: MarkId,
     threatened_ring: MarkId,
     label: MarkId,
     pos: Vector2,
+    /// supply arrows from a logistics hub, by destination objective
     supply_connections: FxHashMap<ObjectiveId, MarkId>,
 }
 
+/// The color associated with a side, with alpha `a`.
 fn text_color(side: Side, a: f32) -> Color {
     match side {
         Side::Red => Color::red(a),
@@ -57,6 +75,7 @@ fn text_color(side: Side, a: f32) -> Color {
     }
 }
 
+/// The text of an objective's status label.
 fn objective_label(name: &str, obj: &Objective) -> CompactString {
     format_compact!(
         "{}\nHealth: {}\nLogi: {}\nSupply: {}\nFuel: {}\nPoints: {}",
@@ -69,6 +88,9 @@ fn objective_label(name: &str, obj: &Objective) -> CompactString {
     )
 }
 
+/// Endpoints of a supply arrow from `obj` to `dst`. Each end is pulled back
+/// along the line to just outside its objective's zone (110% of the radius)
+/// so the arrow doesn't overlap the rings. Returns (start, end).
 fn arrow_coords(obj: &Objective, dst: &Objective) -> (Vector2, Vector2) {
     let pos = obj.zone.pos();
     let dpos = dst.zone.pos();
@@ -80,6 +102,7 @@ fn arrow_coords(obj: &Objective, dst: &Objective) -> (Vector2, Vector2) {
 }
 
 impl ObjectiveMarkup {
+    /// Delete all of this objective's marks from the map.
     pub(super) fn remove(self, msgq: &mut MsgQ) {
         let ObjectiveMarkup {
             side: _,
@@ -106,6 +129,9 @@ impl ObjectiveMarkup {
         }
     }
 
+    /// Bring the markup in line with the current state of `obj`, sending
+    /// only what changed. `moved` lists objectives whose position changed;
+    /// supply arrows pointing at any of them are moved to the new location.
     pub(super) fn update(
         &mut self,
         persisted: &Persisted,
@@ -113,6 +139,7 @@ impl ObjectiveMarkup {
         obj: &Objective,
         moved: &[ObjectiveId],
     ) {
+        // owner changed. supply arrows are deleted here and not redrawn.
         if obj.owner != self.side {
             let text_color = |a| text_color(obj.owner, a);
             self.side = obj.owner;
@@ -135,6 +162,7 @@ impl ObjectiveMarkup {
             || self.fuel != obj.fuel
             || self.points != obj.points
         {
+            // capturability depends only on logi
             if self.logi != obj.logi {
                 msgq.set_markup_color(
                     self.capturable_ring,
@@ -148,6 +176,7 @@ impl ObjectiveMarkup {
             self.points = obj.points;
             msgq.set_markup_text(self.label, objective_label(&self.name, obj).into());
         }
+        // only moves of circular zones are handled (e.g. mobile farps)
         if let Zone::Circle { pos, .. } = obj.zone
             && self.pos != pos
         {
@@ -173,6 +202,11 @@ impl ObjectiveMarkup {
         }
     }
 
+    /// Draw all the markup for `obj` and return the handle to it.
+    ///
+    /// Farp markup is only visible to the owning side; everything else is
+    /// visible to all. The threatened ring is at least
+    /// `cfg.logistics_exclusion` meters in radius.
     pub(super) fn new(cfg: &Cfg, msgq: &mut MsgQ, obj: &Objective, persisted: &Persisted) -> Self {
         let text_color = |a| text_color(obj.owner, a);
         let all_spec = match obj.kind {
@@ -241,6 +275,8 @@ impl ObjectiveMarkup {
                     },
                     None,
                 );
+                // if the exclusion radius extends past the quad, use a
+                // circle of that radius, otherwise a quad 10% larger
                 if !points.contains_circle(pos, cfg.logistics_exclusion as f64) {
                     threat_circle!(0.);
                 } else {
@@ -263,6 +299,7 @@ impl ObjectiveMarkup {
                 }
             }
         }
+        // the capturable ring sits just inside the owner ring (90%)
         match obj.zone {
             Zone::Circle { pos: _, radius } => {
                 msgq.circle_to_all(
@@ -313,6 +350,7 @@ impl ObjectiveMarkup {
         match obj.kind {
             ObjectiveKind::Airbase | ObjectiveKind::Farp { .. } | ObjectiveKind::Fob => (),
             ObjectiveKind::Logistics => {
+                // arrows to farps are only shown to the farp's owner
                 for oid in &obj.warehouse.destination {
                     let id = MarkId::new();
                     let dobj = &persisted.objectives[oid];

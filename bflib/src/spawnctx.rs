@@ -14,6 +14,14 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Spawning and despawning groups in DCS.
+//!
+//! [`SpawnCtx`] bundles the DCS singletons needed to look up group templates
+//! in the miz and spawn them via `coalition.addGroup` /
+//! `coalition.addStaticObject`. Callers fetch a template, modify the clone
+//! (position, units, route), and then spawn it. [`SpawnLoc`] describes
+//! where a newly deployed group should be placed.
+
 use anyhow::{Context, Result, anyhow};
 use bfprotocols::perf::PerfInner;
 use chrono::Utc;
@@ -33,10 +41,13 @@ use log::info;
 use mlua::Value;
 use serde_derive::{Deserialize, Serialize};
 
+/// default airspeed for [`SpawnLoc::InAir`] when not specified
 fn default_speed() -> f64 {
     220.
 }
 
+/// Where to place a group when it is first added to the campaign. Positions
+/// are DCS map coordinates in meters (x, z as a 2d vector).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SpawnLoc {
     /// only for air units, obviously
@@ -57,6 +68,8 @@ pub enum SpawnLoc {
         /// rotate the group to this heading in radians
         group_heading: f64,
     },
+    /// spawn at `pos`, placing units of the types listed in `component_pos`
+    /// at the given positions instead
     AtPosWithComponents {
         pos: Vector2,
         /// the position of sub components of the group by unit type
@@ -73,6 +86,7 @@ pub enum SpawnLoc {
         /// center is the original center of the group
         center: Vector2,
     },
+    /// center the group on the named miz trigger zone
     AtTrigger {
         name: String,
         /// rotate the group to this heading in radians
@@ -90,18 +104,24 @@ impl Default for SpawnLoc {
     }
 }
 
+/// Handles to the DCS APIs needed to spawn things. Cheap to construct, so it
+/// is typically created fresh for each operation that needs it.
 pub struct SpawnCtx<'lua> {
     coalition: Coalition<'lua>,
     miz: Miz<'lua>,
     lua: MizLua<'lua>,
 }
 
+/// Something to remove from the DCS world.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Despawn {
+    /// a live group, by object id
     Group(DcsOid<ClassGroup>),
+    /// a static object, by unit name
     Static(String),
 }
 
+/// The result of a spawn. Statics have no group object to return.
 #[derive(Debug, Clone)]
 pub enum Spawned<'lua> {
     Group(Group<'lua>),
@@ -121,6 +141,9 @@ impl<'lua> SpawnCtx<'lua> {
         self.lua
     }
 
+    /// Look up a group template in the miz and return a deep clone of it
+    /// that may be freely modified before spawning. Fails if no such
+    /// template exists.
     pub fn get_template(
         &self,
         idx: &MizIndex,
@@ -137,6 +160,9 @@ impl<'lua> SpawnCtx<'lua> {
     }
 
     /// get at template that you pinky promise not to modify
+    ///
+    /// This is the miz's own table (no clone), so modifying it would change
+    /// the template for every future spawn.
     pub fn get_template_ref<'a>(
         &'a self,
         idx: &MizIndex,
@@ -156,6 +182,9 @@ impl<'lua> SpawnCtx<'lua> {
             .ok_or_else(|| anyhow!("no such trigger zone {name}"))?)
     }
 
+    /// Spawn the farp pad template `pad_template` with its (first) unit moved
+    /// to `pos`. Since pads are statics with fixed names, spawning one
+    /// replaces any existing pad of the same name, effectively moving it.
     pub fn move_farp_pad(
         &self,
         idx: &MizIndex,
@@ -182,6 +211,9 @@ impl<'lua> SpawnCtx<'lua> {
         self.spawn(pad).context("moving the pad")
     }
 
+    /// Spawn a template into the world. Groups go through
+    /// `coalition.addGroup`; static templates spawn only their first unit
+    /// via `coalition.addStaticObject`.
     pub fn spawn(&self, template: GroupInfo<'lua>) -> Result<Spawned<'lua>> {
         match GroupCategory::from_kind(template.category) {
             Some(category) => Ok(Spawned::Group(
@@ -210,6 +242,8 @@ impl<'lua> SpawnCtx<'lua> {
         }
     }
 
+    /// Destroy a group or static. If the object no longer exists this is
+    /// logged and treated as success.
     pub fn despawn(&self, perf: &mut PerfInner, name: Despawn) -> Result<()> {
         let ts = Utc::now();
         match name {
@@ -243,6 +277,7 @@ impl<'lua> SpawnCtx<'lua> {
     }
     */
 
+    /// Destroy all scenery objects within `radius` meters of `point`.
     #[allow(dead_code)]
     pub fn remove_scenery(&self, point: Vector2, radius: f64) -> Result<()> {
         let alt = Land::singleton(self.lua)?.get_height(LuaVec2(point))?;

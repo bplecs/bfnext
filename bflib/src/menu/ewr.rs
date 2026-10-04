@@ -14,6 +14,14 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! The F10 "EWR" radio menu.
+//!
+//! Lets a player request an on demand bandit or friendly BRAA picture from
+//! the Early Warning Radar tracks maintained by [`crate::ewr::Ewr`], toggle
+//! automatic EWR reports, and choose imperial or metric units. Each command
+//! resolves the menu's group to the slot and player occupying it; if no
+//! player is in the slot the command silently does nothing.
+
 use super::slot_for_group;
 use crate::{
     ewr::{self, EwrUnits},
@@ -25,6 +33,8 @@ use compact_str::format_compact;
 use dcso3::{env::miz::GroupId, mission_commands::MissionCommands, MizLua};
 use std::fmt::Write;
 
+/// Toggle automatic EWR reports for the player in `gid`'s slot and tell
+/// them the new state.
 fn toggle_ewr(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (_, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -44,13 +54,18 @@ fn toggle_ewr(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// Show the player an immediate BRAA report of enemy contacts (the closest
+/// 10 tracks seen in the last 2 minutes), regardless of whether automatic
+/// reports are enabled. Displayed for 10 seconds.
 fn ewr_report(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (_, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
     let mut report = format_compact!("Bandits BRAA\n");
     if let Some(ucid) = ctx.db.ephemeral.player_in_slot(&slot) {
         if let Some(player) = ctx.db.player(ucid) {
+            // only players spawned into their slot have a position to report from
             if let Some((_, Some(inst))) = &player.current_slot {
+                // friendly = false, force = true
                 let chickens = ctx
                     .ewr
                     .where_chicken(Utc::now(), false, true, ucid, player, inst, ctx.db.ephemeral.cfg.ewr_mode, ctx.db.ephemeral.cfg.ewr_delay);
@@ -68,6 +83,8 @@ fn ewr_report(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// Like [`ewr_report`], but reports friendly contacts (excluding the player
+/// themselves).
 fn friendly_ewr_report(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (_, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -92,6 +109,7 @@ fn friendly_ewr_report(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// Switch the player's EWR reports to imperial units (nm, ft, kts).
 fn ewr_units_imperial(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (_, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -105,6 +123,7 @@ fn ewr_units_imperial(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// Switch the player's EWR reports to metric units (km, m, km/h).
 fn ewr_units_metric(lua: MizLua, gid: GroupId) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let (_, slot) = slot_for_group(lua, ctx, &gid).context("getting slot for group")?;
@@ -118,6 +137,7 @@ fn ewr_units_metric(lua: MizLua, gid: GroupId) -> Result<()> {
     Ok(())
 }
 
+/// Add the "EWR" submenu and its commands to the F10 menu of `group`.
 pub(super) fn add_ewr_menu_for_group(mc: &MissionCommands, group: GroupId) -> Result<()> {
     let root = mc.add_submenu_for_group(group, "EWR".into(), None)?;
     mc.add_command_for_group(

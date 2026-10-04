@@ -14,6 +14,24 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Joint Terminal Attack Controller (JTAC) simulation.
+//!
+//! A JTAC is either a deployed ground group (a deployable or troop with a
+//! JTAC spec, or a drone action) identified by [`JtId::Group`], or a player
+//! slot ([`JtId::Slot`]) flying an airborne JTAC type or carrying a JTAC
+//! squad. The set of JTACs that should exist is derived each tick from the
+//! db (`Db::jtacs`); [`Jtacs::update_contacts`] creates/removes [`Jtac`]s to
+//! match, scans enemy units and players within range and line of sight, keeps
+//! a priority-sorted contact list, and lases (laser spot, optional IR pointer
+//! and map mark) the selected target.
+//!
+//! JTACs also direct fire support onto their target: artillery fire missions,
+//! ALCM strikes, target relay and bomber actions. Player control comes from
+//! the F10 menu in [`crate::menu::jtac`] and from chat commands.
+//!
+//! Positions are DCS world coordinates in meters; 2D positions are
+//! `Vector2(x, z)` of the 3D point (y is altitude).
+
 use crate::{
     db::{Db, JtDesc, group::SpawnedUnit, player::InstancedPlayer},
     landcache::LandCache,
@@ -57,9 +75,17 @@ use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
 use std::{collections::hash_map::Entry, fmt, str::FromStr};
 
+/// Identifies a JTAC.
+///
+/// Displayed as the bare group id for groups and `sl<slot>` for slots; the
+/// [`FromStr`] impl parses the same format (slot ids are parsed as unit
+/// slots). Passed to Lua (menu args) as a `{kind, id}` table, kind 0 for
+/// groups and 1 for slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JtId {
+    /// A ground group or drone action group.
     Group(GroupId),
+    /// A player slot acting as a JTAC.
     Slot(SlotId),
 }
 
@@ -112,6 +138,7 @@ impl fmt::Display for JtId {
     }
 }
 
+/// Tell `side` that JTAC `gid` is gone.
 fn ui_jtac_dead(db: &mut Db, side: Side, gid: JtId) {
     db.ephemeral.msgs().panel_to_side(
         10,
@@ -121,6 +148,7 @@ fn ui_jtac_dead(db: &mut Db, side: Side, gid: JtId) {
     )
 }
 
+// direction of an artillery fire adjustment, not currently used
 simple_enum!(AdjustmentDir, u8, [
     Short => 0,
     Long => 1,
@@ -128,36 +156,62 @@ simple_enum!(AdjustmentDir, u8, [
     Right => 3
 ]);
 
+/// Per artillery group fire adjustment state, kept in
+/// [`Jtacs::artillery_adjustment`].
+///
+/// Only `adjust` and `target` currently affect fire: the aim point is the
+/// target position plus `adjust`. Nothing ever sets `adjust` to a non-zero
+/// value, and `group`/`tracked` are written but never read, so this looks
+/// like scaffolding for a shot-adjustment feature.
 #[derive(Debug, Clone)]
 pub struct ArtilleryAdjustment {
+    /// Offset (meters) added to the target position when aiming.
     adjust: Vector2,
+    /// The unadjusted position of the last target fired at.
     target: Vector2,
+    /// Object ids of the units that were tasked to fire.
     group: Vec<DcsOid<ClassUnit>>,
+    /// A weapon being tracked for impact, and its last known position.
     tracked: Option<(Weapon<'static>, Option<Vector3>)>,
 }
 
+/// JTAC ids indexed by side, nearest objective, and laser code. Used to warn
+/// when several JTACs near the same objective share a laser code.
 type LocByCode = FxHashMap<Side, FxHashMap<ObjectiveId, FxHashMap<u16, FxHashSet<JtId>>>>;
 
+/// An enemy unit or player seen by a JTAC.
+///
+/// For player contacts only `pos` is filled in; `typ`, `tags` and
+/// `last_move` stay at their defaults.
 #[derive(Debug, Clone, Default)]
 pub struct Contact {
     pub pos: Vector3,
     pub typ: Vehicle,
     pub tags: UnitTags,
+    /// When the unit last moved, used to skip re-checking line of sight for
+    /// contacts that haven't moved since they were last seen.
     pub last_move: Option<DateTime<Utc>>,
 }
 
+/// The contact a JTAC is currently lasing, and the DCS objects marking it.
 #[derive(Debug, Clone)]
 pub struct JtacTarget {
     pub id: EnId,
+    /// Position of the target when it was selected.
     pub pos: Vector3,
     pub typ: Vehicle,
+    /// The JTAC unit emitting the laser.
     source: DcsOid<ClassUnit>,
+    /// The laser spot.
     spot: DcsOid<ClassSpot>,
+    /// The IR pointer spot, if the IR pointer is enabled.
     ir_pointer: Option<DcsOid<ClassSpot>>,
+    /// The F10 map mark labelling the target for the JTAC's coalition.
     mark: Option<MarkId>,
 }
 
 impl JtacTarget {
+    /// Remove the laser spot, IR pointer and map mark from the mission.
     fn destroy(self, lua: MizLua) -> Result<()> {
         Spot::get_instance(lua, &self.spot)
             .context("getting laser spot")?
@@ -179,15 +233,20 @@ impl JtacTarget {
     }
 }
 
+/// Where a JTAC is, expressed relative to its nearest objective.
 #[derive(Debug, Clone, Copy)]
 pub struct JtacLocation {
     pub pos: Vector2,
+    /// The nearest objective.
     pub oid: ObjectiveId,
+    /// Bearing in radians, as returned by `Db::objective_near_point`.
     pub bearing: f64,
+    /// Distance in meters from the nearest objective.
     pub distance: f64,
 }
 
 impl JtacLocation {
+    /// Compute the location of `pos`. Panics if there are no objectives.
     fn new(db: &Db, pos: Vector3) -> Self {
         let pos = Vector2::new(pos.x, pos.z);
         let (distance, bearing, obj) =
@@ -201,6 +260,10 @@ impl JtacLocation {
     }
 }
 
+/// Iterator over the contacts of several JTACs, interleaving them round
+/// robin (one contact from each JTAC in turn) so the highest priority
+/// contacts of every JTAC come first. Contacts seen by more than one JTAC
+/// are yielded once per JTAC. Returned by [`Jtacs::contacts_near_point`].
 pub struct ContactsIter<'a> {
     contacts: Vec<indexmap::map::Iter<'a, EnId, Contact>>,
     i: usize,
@@ -232,22 +295,39 @@ impl<'a> Iterator for ContactsIter<'a> {
     }
 }
 
+/// The state of a single JTAC.
 #[derive(Debug, Clone)]
 pub struct Jtac {
     gid: JtId,
     side: Side,
+    /// Visible enemies, kept sorted by `priority` (best first).
     contacts: IndexMap<EnId, Contact>,
+    /// Contacts must have all of these tags; empty means no filter.
     filter: BitFlags<UnitTag>,
     location: JtacLocation,
+    /// Target priority list from the config. A contact's priority is the
+    /// index of the first entry whose tags it fully has; unmatched contacts
+    /// sort last.
     priority: Vec<UnitTags>,
     target: Option<JtacTarget>,
+    /// `None` means auto shift is on: the JTAC always lases the highest
+    /// priority contact. `Some(i)` means manual mode, lasing contact index
+    /// `i`.
     autoshift: Option<usize>,
     ir_pointer: bool,
+    /// Laser code, 1xxx; starts at 1688.
     code: u16,
+    /// Time smoke was last deployed, for the 60 second smoke cooldown.
     last_smoke: DateTime<Utc>,
+    /// Friendly artillery groups in range of the current target.
     nearby_artillery: SmallVec<[GroupId; 8]>,
+    /// Friendly ALCM groups in range, with their missile counts.
     nearby_alcm: SmallVec<[(GroupId, i32); 8]>,
+    /// Set when the nearby artillery/ALCM lists changed and menus listing
+    /// this JTAC must be rebuilt; drained by [`Jtacs::update_contacts`].
     menu_dirty: bool,
+    /// Airborne JTAC: the laser originates 5m below the unit rather than 10m
+    /// above it.
     air: bool,
 }
 
@@ -279,6 +359,13 @@ impl Jtac {
         }
     }
 
+    /// Build the multi-line status report shown to players: current target and
+    /// laser code (noting other JTACs near the same objective on the same
+    /// code), position relative to the nearest objective, visible contacts by
+    /// type, settings, and available artillery/ALCM.
+    ///
+    /// Errors if a contact's type can't be resolved (e.g. a player contact
+    /// that is no longer instanced) or the nearest objective is missing.
     pub fn status(&self, db: &Db, loc_by_code: &LocByCode) -> Result<CompactString> {
         use std::fmt::Write;
         fn get_typ(db: &Db, id: &EnId) -> Result<Vehicle> {
@@ -405,6 +492,8 @@ impl Jtac {
         Ok(msg)
     }
 
+    /// Add or refresh a unit contact. New contacts are appended (lowest
+    /// priority) until the next [`Jtac::sort_contacts`].
     fn add_unit_contact(&mut self, unit: &SpawnedUnit) {
         let ct = self.contacts.entry(EnId::Unit(unit.id)).or_default();
         ct.pos = unit.position.p.0;
@@ -418,6 +507,7 @@ impl Jtac {
         ct.pos = inst.position.p.0;
     }
 
+    /// Clear the current target, destroying its spots and map mark.
     fn remove_target(&mut self, _db: &Db, lua: MizLua) -> Result<()> {
         if let Some(target) = self.target.take() {
             target
@@ -427,6 +517,8 @@ impl Jtac {
         Ok(())
     }
 
+    /// (Re)place the coalition map mark on the current target, showing its
+    /// type and laser code. Panics if the target is not in `contacts`.
     fn mark_target(&mut self, lua: MizLua) -> Result<()> {
         if let Some(target) = &mut self.target {
             let act = Trigger::singleton(lua)?.action()?;
@@ -448,6 +540,15 @@ impl Jtac {
         Ok(())
     }
 
+    /// Lase contact index `i`, creating the laser spot (and IR pointer if
+    /// enabled) from the JTAC unit and marking it on the map. Also recomputes
+    /// nearby artillery/ALCM for the target position, flagging the menu dirty
+    /// if they changed.
+    ///
+    /// Returns `Ok(true)` if a new target was selected, or if the JTAC's unit
+    /// could not be found (in which case the old target has been removed and
+    /// no new one set). Returns `Ok(false)` if contact `i` was already the
+    /// target. Errors if `i` is out of range.
     fn set_target(&mut self, db: &Db, lua: MizLua, i: usize) -> Result<bool> {
         let (id, ct) = self
             .contacts
@@ -489,6 +590,7 @@ impl Jtac {
                         return Ok(true);
                     }
                 };
+                // laser origin relative to the jtac unit, meters (y is up)
                 let offset = if self.air {
                     Vector3::new(0., -5., 0.)
                 } else {
@@ -537,6 +639,9 @@ impl Jtac {
         }
     }
 
+    /// Replace one digit of the laser code; see [`Jtacs::set_code_part`].
+    /// Updates the live laser spot and map mark if there is a target. Errors
+    /// if `code_part` mixes scales (e.g. 610).
     fn set_code(&mut self, lua: MizLua, code_part: u16) -> Result<()> {
         let hundreds = code_part / 100;
         let tens = code_part / 10;
@@ -563,6 +668,9 @@ impl Jtac {
         Ok(())
     }
 
+    /// Move to the next contact (wrapping around) and switch to manual mode.
+    /// Returns `Ok(false)` without doing anything if there are no contacts,
+    /// otherwise the result of [`Jtac::set_target`].
     pub fn shift(&mut self, db: &Db, lua: MizLua) -> Result<bool> {
         if self.contacts.is_empty() {
             return Ok(false);
@@ -591,6 +699,10 @@ impl Jtac {
         self.set_target(db, lua, i).context("setting target")
     }
 
+    /// Remove contact `id`. Returns `Ok(true)` if it was the current target
+    /// (which is then removed too).
+    ///
+    /// Uses `swap_remove`, which disturbs contact order until the next sort.
     fn remove_contact(&mut self, lua: MizLua, db: &Db, id: &EnId) -> Result<bool> {
         if let Some(_) = self.contacts.swap_remove(id) {
             if let Some(target) = &self.target {
@@ -603,6 +715,9 @@ impl Jtac {
         Ok(false)
     }
 
+    /// Sort contacts by priority (stable, so equal priority contacts keep
+    /// their order). In auto shift mode, then target the best contact.
+    /// Returns `Ok(true)` if the target changed (see [`Jtac::set_target`]).
     fn sort_contacts(&mut self, db: &Db, lua: MizLua) -> Result<bool> {
         let plist = &self.priority;
         let priority = |tags: UnitTags| {
@@ -621,6 +736,10 @@ impl Jtac {
         Ok(false)
     }
 
+    /// Drop smoke within ~10m of the current target, at ground level. The
+    /// color is the opposing side's (red smoke for blue JTACs and vice
+    /// versa). Limited to once per 60 seconds; errors if on cooldown. Does
+    /// nothing if there is no target.
     pub fn smoke_target(&mut self, lua: MizLua) -> Result<()> {
         if let Some(target) = &self.target {
             if let Some(ct) = self.contacts.get(&target.id) {
@@ -649,6 +768,8 @@ impl Jtac {
         Ok(())
     }
 
+    /// Recreate the spots for the current target, e.g. after the IR pointer
+    /// setting changed or the lasing unit died.
     fn reset_target(&mut self, db: &Db, lua: MizLua) -> Result<()> {
         if let Some(target) = &self.target {
             if let Some(i) = self.contacts.get_index_of(&target.id) {
@@ -659,6 +780,9 @@ impl Jtac {
         Ok(())
     }
 
+    /// Task artillery group `gid` to fire `n` rounds at the current target
+    /// (plus any adjustment) from its current position. This replaces the
+    /// group's current task. Errors if there is no target.
     pub fn artillery_mission(
         &mut self,
         db: &Db,
@@ -718,6 +842,12 @@ impl Jtac {
         Ok(())
     }
 
+    /// Task artillery group `gid` to fire `rounds_per_target` rounds at each
+    /// of the first `num_targets` contacts (in priority order), as one combo
+    /// task. Requires a current target, though the fire points come from the
+    /// contact list. Errors if the group lacks ammo for the full mission.
+    ///
+    /// Ammo is the first ammo entry of each unit, summed and saturated at 255.
     pub fn artillery_combo_mission(
         &mut self,
         db: &Db,
@@ -821,6 +951,16 @@ impl Jtac {
         Ok(())
     }
 
+    /// Task ALCM aircraft group `gid` to launch cruise missiles at the
+    /// contacts, `per_target` missiles each, in priority order until the
+    /// missile budget runs out.
+    ///
+    /// `n` is `[magazine_expend, per_target]`: magazine_expend 1/2/4 spends a
+    /// quarter/half/all of the missiles, per_target is 1, 2 or 4. Panics if
+    /// `n` has fewer than two elements. The budget is computed from the
+    /// missile count of the group's last unit. The mission is pushed onto
+    /// the group's task stack (not replacing its current task) and also
+    /// gives the group unlimited fuel. Errors if there is no target.
     pub fn alcm_mission(
         &mut self,
         db: &Db,
@@ -977,6 +1117,9 @@ impl Jtac {
         Ok(())
     }
 
+    /// Task group `gid` to attack the current target unit directly (an
+    /// AttackUnit task at the target's ground position), replacing its
+    /// current task. Errors if there is no target or it can't be found.
     pub fn relay_target(&mut self, db: &Db, lua: MizLua, gid: &GroupId) -> Result<()> {
         match self.target.as_mut() {
             None => bail!("no target"),
@@ -1040,6 +1183,9 @@ impl Jtac {
         Ok(())
     }
 
+    /// Follow a moving target: if it moved more than ~1.4m (squared distance
+    /// > 2) move the laser spot to its position plus one second of velocity
+    /// (a simple lead) and refresh the map mark. The IR pointer isn't moved.
     fn update_target_position(&mut self, lua: MizLua, db: &Db) -> Result<()> {
         if let Some(target) = &self.target {
             let (pos, velocity) = match &target.id {
@@ -1078,6 +1224,8 @@ impl Jtac {
         Ok(())
     }
 
+    /// Toggle auto shift. Turning it off locks onto the current target;
+    /// turning it on immediately retargets the highest priority contact.
     pub fn toggle_auto_shift(&mut self, db: &Db, lua: MizLua) -> Result<()> {
         match self.autoshift {
             None => match self.target.as_ref() {
@@ -1101,11 +1249,15 @@ impl Jtac {
         Ok(())
     }
 
+    /// Remove the tag filter. Contacts it excluded reappear on the next
+    /// contact update.
     pub fn clear_filter(&mut self, db: &Db, lua: MizLua) -> Result<bool> {
         self.filter = BitFlags::empty();
         self.sort_contacts(db, lua)
     }
 
+    /// Add `tag` to the filter. Contacts lacking any filter tag are dropped
+    /// on the next contact update, not immediately.
     pub fn add_filter(&mut self, db: &Db, lua: MizLua, tag: BitFlags<UnitTag>) -> Result<bool> {
         self.filter |= tag;
         self.sort_contacts(db, lua)
@@ -1131,6 +1283,7 @@ impl Jtac {
         &self.target
     }
 
+    /// True if auto shift is enabled.
     pub fn autoshift(&self) -> bool {
         self.autoshift.is_none()
     }
@@ -1152,18 +1305,25 @@ impl Jtac {
     }
 }
 
+/// Whether any JTAC has detected an enemy, this update and last update. A
+/// change emits a [`Stat::Detected`].
 #[derive(Debug, Clone, Default)]
 struct Detected {
     was_detected: bool,
     detected: bool,
 }
 
+/// All JTACs in the mission, plus shared bookkeeping.
 #[derive(Debug, Clone, Default)]
 pub struct Jtacs {
     jtacs: FxHashMap<Side, FxHashMap<JtId, Jtac>>,
+    /// Detection state keyed by the side of the detected units (i.e. the
+    /// opposite of the detecting JTACs' side).
     detected: FxHashMap<Side, FxHashMap<EnId, Detected>>,
     artillery_adjustment: FxHashMap<GroupId, ArtilleryAdjustment>,
     code_by_location: LocByCode,
+    /// Objectives, per side, whose JTAC menus need rebuilding. Taken and
+    /// returned by [`Jtacs::update_contacts`].
     menu_dirty: FxHashMap<Side, FxHashSet<ObjectiveId>>,
 }
 
@@ -1191,6 +1351,8 @@ impl Jtacs {
         self.jtacs.values_mut().flat_map(|jtx| jtx.values_mut())
     }
 
+    /// Have JTAC `jtid` direct `n` rounds from artillery group `shooter`; see
+    /// [`Jtac::artillery_mission`].
     pub fn artillery_mission(
         &mut self,
         db: &Db,
@@ -1216,6 +1378,9 @@ impl Jtacs {
         jtac.artillery_mission(db, lua, adjustment, &shooter, n)
     }
 
+    /// Like [`Jtacs::artillery_mission`] with `n` set to the group's total
+    /// remaining rounds (first ammo entry per unit, saturated at 255). Errors
+    /// if the group has no ammo.
     pub fn artillery_fire_all(
         &mut self,
         db: &Db,
@@ -1260,6 +1425,7 @@ impl Jtacs {
         jtac.artillery_mission(db, lua, adjustment, &shooter, total_ammo)
     }
 
+    /// Describe the total rounds remaining in artillery group `shooter`.
     pub fn get_artillery_ammo(
         &self,
         db: &Db,
@@ -1284,6 +1450,7 @@ impl Jtacs {
         Ok(result.into())
     }
 
+    /// See [`Jtac::artillery_combo_mission`].
     pub fn artillery_combo_mission(
         &mut self,
         db: &Db,
@@ -1311,6 +1478,7 @@ impl Jtacs {
         jtac.artillery_combo_mission(db, lua, adjustment, &shooter, rounds_per_target, num_targets)
     }
 
+    /// See [`Jtac::alcm_mission`].
     pub fn alcm_mission(
         &mut self,
         db: &Db,
@@ -1343,6 +1511,7 @@ impl Jtacs {
         Ok(())
     }
 
+    /// The current targets of all JTACs.
     pub fn jtac_targets<'a>(&'a self) -> impl Iterator<Item = EnId> + 'a {
         self.jtacs.values().flat_map(|j| {
             j.values()
@@ -1350,6 +1519,8 @@ impl Jtacs {
         })
     }
 
+    /// Contacts of `side`'s JTACs located within `dist` meters of `point`,
+    /// interleaved across JTACs (see [`ContactsIter`]).
     pub fn contacts_near_point<'a>(
         &'a self,
         side: Side,
@@ -1411,6 +1582,13 @@ impl Jtacs {
         &self.code_by_location
     }
 
+    /// Handle the death of DCS unit `id`.
+    ///
+    /// If it belonged to a JTAC, the JTAC is removed when it was a slot JTAC
+    /// or the last living unit of a group JTAC (this runs before the db
+    /// marks the unit dead, hence `<= 1`); otherwise, if it was the unit
+    /// emitting the laser, the target is reset so it can be re-lased. If it
+    /// was any JTAC's target, that target is cleared and the side is told.
     pub fn unit_dead(&mut self, lua: MizLua, db: &mut Db, id: &DcsOid<ClassUnit>) -> Result<()> {
         let ctid = db
             .ephemeral
@@ -1493,6 +1671,8 @@ impl Jtacs {
         Ok(())
     }
 
+    /// Refresh the db positions of all JTAC targets and move the laser spots
+    /// to follow them. Returns the object ids of targets found to be dead.
     pub fn update_target_positions(
         &mut self,
         lua: MizLua,
@@ -1525,6 +1705,7 @@ impl Jtacs {
         Ok(dead)
     }
 
+    /// Clear the per-update detected flags before a new scan.
     fn prepare_detected(&mut self) {
         for detected in self.detected.values_mut() {
             for dt in detected.values_mut() {
@@ -1533,6 +1714,15 @@ impl Jtacs {
         }
     }
 
+    /// Update one JTAC described by `jt`, creating it if new.
+    ///
+    /// Recomputes its location (moving its laser code registration and
+    /// dirtying menus if its nearest objective changed), then scans every
+    /// enemy instanced unit and player: those within `spec.range` meters and
+    /// in line of sight (unless `spec.nolos`) that pass the filter become
+    /// contacts, others are dropped. Airborne fixed-wing aircraft are never
+    /// added as contacts. Records the JTAC in `saw_jtacs`, every enemy considered in
+    /// `saw_units`, and dropped targets in `lost_targets`.
     fn update_jtac(
         &mut self,
         lua: MizLua,
@@ -1605,6 +1795,7 @@ impl Jtacs {
             menu.insert(prev_loc.oid);
             menu.insert(jtac.location.oid);
         }
+        // line of sight is checked from the same point the laser originates
         if air {
             pos.y -= 5.
         } else {
@@ -1637,6 +1828,8 @@ impl Jtacs {
             if unit.airborne_velocity.is_some() && !unit.tags.contains(UnitTag::Helicopter) {
                 lost!();
             }
+            // neither side moved since the last scan, so visibility can't
+            // have changed; skip the expensive line of sight check
             if let Some(ct) = jtac.contacts.get(&id) {
                 if !jtac_moved && unit.moved == ct.last_move {
                     detected.detected = true;
@@ -1689,6 +1882,15 @@ impl Jtacs {
         Ok(())
     }
 
+    /// Periodic JTAC update, called from the main loop.
+    ///
+    /// Updates every JTAC the db says should exist ([`Jtacs::update_jtac`]),
+    /// removes JTACs that no longer exist (notifying their side), drops
+    /// contacts that are no longer instanced, emits detection stats, refreshes
+    /// nearby ALCM, re-sorts contacts and auto-targets, and broadcasts a
+    /// status report for every JTAC that picked a new target.
+    ///
+    /// Returns, per side, the objectives whose JTAC menus need rebuilding.
     pub fn update_contacts(
         &mut self,
         lua: MizLua,

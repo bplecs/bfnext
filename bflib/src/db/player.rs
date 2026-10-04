@@ -14,6 +14,17 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Player state: registration, side switching, slot authorization, lives, and points.
+//!
+//! Players are keyed by [`Ucid`] and persisted across restarts. This module decides whether
+//! a player may occupy a slot ([`Db::try_occupy_slot`]), tracks them while they fly
+//! (position updates, takeoff and landing), and implements the economy:
+//! - lives: per [`LifeType`], taken on takeoff from a friendly objective and returned on
+//!   landing at one, with lives restored after a configured reset time.
+//! - points: earned for kills, logistics work, etc., and spent on airframes, weapons,
+//!   deployables, and troops. When a player can't cover a cost the objective it's bought
+//!   at covers the remainder (see [`Db::charge_for_item`]). Team kills are penalized.
+
 use super::{Db, MapS, SetS, ephemeral::SlotInfo, group::DeployKind};
 use crate::{maybe, maybe_mut, objective_mut};
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,42 +51,63 @@ use serde_derive::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
 use std::cmp::{max, min};
 
+/// Who was killed, for computing team kill penalties. `None` (no `VictimInfo`) means an AI
+/// unit not owned by any player.
 struct VictimInfo {
     ucid: Ucid,
     name: String,
+    /// the victim was an AI unit deployed by this player
     ai_deployable: bool,
+    /// the life type the victim was airborne in, if they were a player in flight
     life_type: Option<LifeType>,
 }
 
+/// The result of a slot occupancy check.
 #[derive(Debug, Clone)]
 pub enum SlotAuth {
+    /// the player may occupy the slot. Carries the unit type and tags for stats when the
+    /// slot is an aircraft slot.
     Yes(Option<stats::Unit>),
+    /// the slot's objective isn't owned by the player's side, or the player is locked to
+    /// the given side
     ObjectiveNotOwned(Side),
+    /// the slot's objective has no logistics (logi is 0)
     ObjectiveHasNoLogistics,
+    /// the player has no lives left for this life type
     NoLives(LifeType),
+    /// the player and objective together can't afford the airframe
     NoPoints {
         vehicle: Vehicle,
         cost: u32,
         balance: i32,
     },
+    /// the player hasn't picked a side yet
     NotRegistered(Side),
+    /// the objective's warehouse has none of this airframe in stock
     VehicleNotAvailable(Vehicle),
     Denied,
 }
 
+/// Why [`Db::register_player`] failed.
 pub enum RegErr {
+    /// the player is already registered on another side. Carries the number of side
+    /// switches remaining (None = unlimited) and the side they're on.
     AlreadyRegistered(Option<u8>, Side),
+    /// the player is already on the requested side
     AlreadyOn(Side),
 }
 
+/// The result of [`Db::takeoff`].
 #[derive(Debug, Clone)]
 pub enum TakeoffRes {
     TookLife(LifeType),
     NoLifeTaken,
     OutOfLives,
+    /// points are strict and the player and objective can't afford the flight
     OutOfPoints,
 }
 
+/// Runtime state of a player who is currently in an aircraft/unit.
 #[derive(Debug, Clone, Default)]
 pub struct InstancedPlayer {
     pub unit_name: String,
@@ -83,39 +115,65 @@ pub struct InstancedPlayer {
     pub velocity: Vector3,
     pub typ: Vehicle,
     pub in_air: bool,
+    /// the objective the player is on the ground at, cleared on takeoff
     pub landed_at_objective: Option<ObjectiveId>,
+    /// true while the player is sitting still at an objective. When they start moving
+    /// again they are told what their flight will cost.
     pub stopped_at_objective: bool,
+    /// the last time the unit was observed to move
     pub moved: Option<DateTime<Utc>>,
+    /// fraction of the flight cost paid by the player rather than the objective, used to
+    /// split the refund on landing
     pub cost_fraction: f32,
 }
 
+/// A registered player.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Player {
+    /// the most recent name the player connected with
     pub name: String,
+    /// every name the player has connected with
     pub alts: SetS<String>,
     pub side: Side,
+    /// side switches remaining this round, None for unlimited
     pub side_switches: Option<u8>,
+    /// for each life type the player has used: (start of the reset period, lives left).
+    /// A missing entry means the player has the full default number of lives.
     pub lives: MapS<LifeType, (DateTime<Utc>, u8)>,
+    /// crates on the ground owned by this player
     pub crates: SetS<GroupId>,
+    /// the life type the player is currently flying on, if airborne
     #[serde(default)]
     pub airborne: Option<LifeType>,
+    /// may go negative
     #[serde(default)]
     pub points: i32,
+    /// timestamps of team kills of AI units
     #[serde(default)]
     pub ai_team_kills: SetS<DateTime<Utc>>,
+    /// timestamps and victims of team kills of players
     #[serde(default)]
     pub player_team_kills: MapS<DateTime<Utc>, Ucid>,
+    /// the slot the player occupies, and the unit state once they have spawned in it
     #[serde(skip)]
     pub current_slot: Option<(SlotId, Option<InstancedPlayer>)>,
+    /// the player has been allowed into a slot whose slot info isn't known yet, so the
+    /// real check is deferred. While set, being deslotted won't force them to spectators.
     #[serde(skip)]
     pub changing_slots: bool,
+    /// the player is in spectators or a non aircraft (CA, instructor) slot. While set,
+    /// being deslotted won't force them to spectators.
     #[serde(skip)]
     pub jtac_or_spectators: bool,
+    /// points earned this sortie that will be committed on landing at a friendly objective
+    /// (only used when provisional points are enabled), forfeited on deslot
     #[serde(skip)]
     pub provisional_points: i32,
 }
 
 impl Db {
+    /// Remove the player from their current slot, if any. Forfeits provisional points,
+    /// clears the airborne state, and drops any cargo the slot was carrying.
     pub fn player_deslot(&mut self, ucid: &Ucid) {
         if let Some(player) = self.persisted.players.get_mut_cow(ucid) {
             player.airborne = None;
@@ -138,6 +196,9 @@ impl Db {
         self.persisted.players.get_mut_cow(ucid)
     }
 
+    /// Move `amount` points from `source` to another player (`Left`) or into an objective's
+    /// point pool (`Right`). Errors if the source can't afford it or the target doesn't
+    /// exist, in which case the source's balance is restored.
     pub fn transfer_points(
         &mut self,
         source: &Ucid,
@@ -202,6 +263,7 @@ impl Db {
         }
     }
 
+    /// Restore all of the player's lives immediately.
     pub fn player_reset_lives(&mut self, ucid: &Ucid) -> Result<()> {
         maybe_mut!(self.persisted.players, ucid, "player")?.lives = MapS::new();
         self.ephemeral.stat(Stat::Life {
@@ -212,6 +274,7 @@ impl Db {
         Ok(())
     }
 
+    /// Iterate over all players who are in a slot and have spawned into it.
     pub fn instanced_players(&self) -> impl Iterator<Item = (&Ucid, &Player, &InstancedPlayer)> {
         self.ephemeral.players_by_slot.values().filter_map(|ucid| {
             self.persisted.players.get(ucid).and_then(|player| {
@@ -224,6 +287,9 @@ impl Db {
         })
     }
 
+    /// Find the player controlling the DCS unit `id`. If `include_deployed` is true, AI
+    /// units deployed by a player (deployables, troops, actions) are attributed to that
+    /// player as well.
     pub fn player_in_unit(&self, include_deployed: bool, id: &DcsOid<ClassUnit>) -> Option<Ucid> {
         match self
             .ephemeral
@@ -265,6 +331,9 @@ impl Db {
         }
     }
 
+    /// Compute the points cost of flying `unit` with its current loadout: the airframe cost
+    /// plus the cost of each priced weapon. Returns (cost, strict, human readable
+    /// breakdown). The cost is 0 if points are disabled.
     fn compute_flight_cost(&self, sifo: &SlotInfo, unit: &Unit) -> Result<(u32, bool, String)> {
         use std::fmt::Write;
         let mut m = String::from("");
@@ -291,6 +360,14 @@ impl Db {
         }
     }
 
+    /// Handle a takeoff from `position`.
+    ///
+    /// If lives are limited and the player took off from a friendly objective, a life of the
+    /// slot's life type is taken. If they took off from a friendly objective the flight cost
+    /// is charged (see [`Db::charge_for_item`]); it's refunded on landing at a friendly
+    /// objective (see [`Db::land`]). With strict points,
+    /// returns `OutOfPoints` without charging anything if the player and objective can't
+    /// afford the flight; the caller is responsible for acting on that.
     pub fn takeoff(
         &mut self,
         time: DateTime<Utc>,
@@ -331,6 +408,7 @@ impl Db {
             None => bail!("no life type for vehicle {:?}", sifo.typ),
             Some(typ) => *typ,
         };
+        // the first takeoff on a full set of lives starts the reset timer
         let (_, player_lives) = player.lives.get_or_insert_cow(life_type, || {
             (time, self.ephemeral.cfg.default_lives[&life_type].0)
         });
@@ -359,6 +437,7 @@ impl Db {
             self.ephemeral.dirty();
             Ok(TakeoffRes::TookLife(life_type))
         } else {
+            // took off away from a friendly objective (e.g. a field), no life is taken
             Ok(TakeoffRes::NoLifeTaken)
         };
         if cost > 0
@@ -375,6 +454,13 @@ impl Db {
         res
     }
 
+    /// Charge `cost` points for an item bought at objective `oid`.
+    ///
+    /// The player pays as much as their positive balance allows and the objective's point
+    /// pool covers the rest (the objective may go negative). If the objective doesn't
+    /// exist the player pays the full cost (possibly going negative). Returns the fraction
+    /// of the cost paid by the player (0.0 - 1.0), to be passed to [`Db::refund_points`].
+    /// Unknown players are not charged and 1.0 is returned.
     pub fn charge_for_item(&mut self, ucid: &Ucid, oid: ObjectiveId, cost: u32, msg: &str) -> f32 {
         match self.player(ucid) {
             None => 1.,
@@ -403,6 +489,8 @@ impl Db {
         }
     }
 
+    /// Refund `cost` points, giving `frac` of it to the player and the rest to objective
+    /// `oid`, mirroring how [`Db::charge_for_item`] split the original charge.
     pub fn refund_points(
         &mut self,
         ucid: &Ucid,
@@ -419,6 +507,12 @@ impl Db {
         self.adjust_points(ucid, cost, msg);
     }
 
+    /// Handle a landing at `position`.
+    ///
+    /// Landing at a friendly objective returns a life (dropping the entry once lives are
+    /// full again), refunds the flight cost for the current loadout, and commits any
+    /// provisional points. Returns the life type whose life was returned when lives are
+    /// limited, otherwise `None`. Landing elsewhere does nothing.
     pub fn land(&mut self, slot: SlotId, position: Vector2, unit: &Unit) -> Option<LifeType> {
         let sifo = match self.ephemeral.slot_info.get(&slot) {
             Some(sifo) => sifo,
@@ -494,6 +588,8 @@ impl Db {
         }
     }
 
+    /// Restore every life type whose reset period (from `default_lives`, in seconds) has
+    /// elapsed since it was started.
     pub fn maybe_reset_lives(&mut self, ucid: &Ucid, now: DateTime<Utc>) -> Result<()> {
         let mut lt_to_reset: SmallVec<[LifeType; 2]> = smallvec![];
         let player = self
@@ -524,6 +620,13 @@ impl Db {
         Ok(())
     }
 
+    /// Decide whether the player may occupy `slot` on `slot_side`.
+    ///
+    /// Spectators are always allowed. If sides aren't locked, picking a slot on the other
+    /// side moves the player to that side. Instructor slots require admin, combined arms
+    /// slots require the CA rule. Aircraft slots with known slot info are checked by
+    /// [`Db::try_occupy_slot_deferred`]; unknown slots are allowed provisionally and checked
+    /// later.
     pub fn try_occupy_slot(
         &mut self,
         time: DateTime<Utc>,
@@ -583,6 +686,11 @@ impl Db {
         }
     }
 
+    /// Check whether the player may occupy the aircraft `slot`. The slot's objective must be
+    /// owned by the player's side and have logistics, the player and objective together
+    /// must afford the airframe, the player must have a life of the slot's life type (lives
+    /// whose reset time has elapsed are restored first), and if warehouses are enabled the
+    /// airframe must be in stock (unless exempt).
     pub fn try_occupy_slot_deferred(
         &mut self,
         time: DateTime<Utc>,
@@ -613,6 +721,8 @@ impl Db {
             return SlotAuth::ObjectiveHasNoLogistics;
         }
         let life_type = self.ephemeral.cfg.life_types[&sifo.typ];
+        // final warehouse check then allow. Uses `break`, so it must be expanded inside the
+        // `loop` below, which exists only so this macro can return a value from it.
         macro_rules! yes {
             () => {
                 if let Some(whcfg) = self.ephemeral.cfg.warehouse.as_ref() {
@@ -675,6 +785,8 @@ impl Db {
         }
     }
 
+    /// Handle a player connecting. Clears any stale slot from a previous session and
+    /// records a changed name (keeping the old one in `alts`).
     pub fn player_connected(&mut self, ucid: Ucid, name: String) {
         if let Some(player) = self.persisted.players.get(&ucid) {
             if player.current_slot.is_some() {
@@ -690,6 +802,8 @@ impl Db {
         }
     }
 
+    /// Register a new player on `side`, granting the configured new player points and side
+    /// switch allowance. Fails if the player is already registered.
     pub fn register_player(&mut self, ucid: Ucid, name: String, side: Side) -> Result<(), RegErr> {
         match self.persisted.players.get(&ucid) {
             Some(p) if p.side != side => Err(RegErr::AlreadyRegistered(p.side_switches, p.side)),
@@ -733,6 +847,7 @@ impl Db {
         }
     }
 
+    /// Move the player to `side` unconditionally (admin), without using a side switch.
     pub fn force_sideswitch_player(&mut self, ucid: &Ucid, side: Side) -> Result<()> {
         let player = maybe_mut!(self.persisted.players, ucid, "no such player")?;
         player.side = side;
@@ -741,6 +856,8 @@ impl Db {
         Ok(())
     }
 
+    /// Switch the player to `side` at their request, consuming one side switch if they are
+    /// limited. Returns a user facing error message on failure.
     pub fn sideswitch_player(&mut self, ucid: &Ucid, side: Side) -> Result<(), &'static str> {
         match self.persisted.players.get_mut_cow(ucid) {
             None => Err("You are not registered. Type blue or red to join a side"),
@@ -767,6 +884,10 @@ impl Db {
         }
     }
 
+    /// Sync the position, velocity, and in air state of the given players' units from DCS,
+    /// and publish position stats. A player who was stopped at an objective and starts
+    /// moving is told what their flight will cost. Returns the object ids of units that
+    /// could no longer be found.
     pub fn update_player_positions<'a>(
         &mut self,
         lua: MizLua,
@@ -774,6 +895,7 @@ impl Db {
         ids: impl IntoIterator<Item = &'a Ucid>,
     ) -> Result<Vec<DcsOid<ClassUnit>>> {
         let mut dead: Vec<DcsOid<ClassUnit>> = vec![];
+        // reuse one unit handle across iterations rather than creating a new one each time
         let mut unit: Option<Unit> = None;
         let coord = Coord::singleton(lua)?;
         for ucid in ids {
@@ -795,6 +917,7 @@ impl Db {
                         match instance {
                             Ok(instance) => {
                                 let pos = instance.get_position()?;
+                                // moved more than 1 meter
                                 if (inst.position.p.0 - pos.p.0).magnitude_squared() > 1.0 {
                                     if inst.stopped_at_objective {
                                         inform_cost = Some((*slot, player.points));
@@ -848,6 +971,9 @@ impl Db {
         Ok(dead)
     }
 
+    /// Update the positions of about a tenth of the slotted players, starting at index `i`,
+    /// to spread the work over several calls. Returns the index to pass next time (0 once
+    /// all players have been processed) and any units that could no longer be found.
     pub fn update_player_positions_incremental(
         &mut self,
         lua: MizLua,
@@ -868,6 +994,14 @@ impl Db {
         }
     }
 
+    /// Handle a player's unit spawning in `slot` at objective `oid`.
+    ///
+    /// Any other player recorded in the slot is deslotted. If the player has no lives left
+    /// for the slot's life type they are deslotted and the unit destroyed. Otherwise the
+    /// slot/unit indexes and the player's [`InstancedPlayer`] state are set up, and the
+    /// objective's warehouse inventory is synced (for ground starts the airframe and its
+    /// loaded weapons are removed from the DCS warehouse first). Warehouse errors are
+    /// logged, not returned.
     pub fn player_entered_slot(
         &mut self,
         lua: MizLua,
@@ -961,6 +1095,14 @@ impl Db {
         Ok(())
     }
 
+    /// Handle a player leaving the unit `objid`.
+    ///
+    /// If the unit is a campaign ground unit (combined arms) its final position is synced.
+    /// If it's a player slot and the player was on the ground at an objective, the
+    /// objective's warehouse inventory is synced; at objectives that aren't airbases (or
+    /// extra fixed wing objectives) the airframe and its remaining weapons are first added
+    /// back to the DCS warehouse. The player is then deslotted. Returns any units that
+    /// could no longer be found while syncing positions.
     pub fn player_left_unit(
         &mut self,
         lua: MizLua,
@@ -1024,6 +1166,8 @@ impl Db {
         Ok(dead)
     }
 
+    /// Handle a player disconnecting: queue a warehouse sync if they were on the ground at
+    /// an objective, then deslot them.
     pub fn player_disconnected(&mut self, ucid: &Ucid) {
         if let Some((_, Some(inst))) = self
             .persisted
@@ -1039,6 +1183,18 @@ impl Db {
         self.player_deslot(ucid);
     }
 
+    /// Penalize `shooter` for a team kill worth `total_points`, returning the message to
+    /// show them.
+    ///
+    /// - killing an unowned friendly AI unit costs `total_points` plus, for each previous AI
+    ///   team kill, `total_points` halved once per `tk_window` hours since it happened.
+    /// - killing a friendly player on the ground, or a player's deployed AI, costs a flat
+    ///   `total_points`.
+    /// - killing an airborne friendly player escalates the same way for points, and also
+    ///   costs lives (1 plus a decaying amount for each previous player team kill). Lives
+    ///   are taken from the victim's life type first, then from progressively higher life
+    ///   types (see [`LifeType::up`]). If every life type runs out and the penalty was
+    ///   large enough, the shooter is forced to spectators after 30 seconds.
     fn apply_teamkill_penalty(
         &mut self,
         shooter: Ucid,
@@ -1110,6 +1266,8 @@ impl Db {
                 let mut penalty_lives = penalty_lives.round() as u32;
                 let mut lost: SmallVec<[(LifeType, u8); 5]> = smallvec![];
                 let mut life_type = *life_type;
+                // take lives starting with the victim's life type, spilling any remainder
+                // over to the next life type up
                 let deplane = loop {
                     let (_, player_lives) = player.lives.get_or_insert_cow(life_type, || {
                         (Utc::now(), self.ephemeral.cfg.default_lives[&life_type].0)
@@ -1169,6 +1327,14 @@ impl Db {
         }
     }
 
+    /// Award points for the death described by `dead`.
+    ///
+    /// Credit goes to every player (or owner of a player deployed AI unit) that hit the
+    /// victim, or if nobody hit it, to everyone who shot at it within 3 minutes of its
+    /// death. The kill value (LR SAM track radar, aircraft, or ground) is split evenly
+    /// between them, rounding up. Shooters on the victim's side get a team kill penalty
+    /// instead. With provisional points, a player's direct kill points are held as
+    /// provisional until they land.
     pub fn award_kill_points(&mut self, cfg: &PointsCfg, dead: &Dead) {
         let mut hit_by: SmallVec<[(Ucid, bool); 16]> = smallvec![];
         let valid_shots = || {
@@ -1194,6 +1360,8 @@ impl Db {
                     }
                 })
         };
+        // (ucid, provisional) of each credited shooter. Points earned by a player's AI are
+        // never provisional.
         for shot in valid_shots() {
             let k = match shot.shooter {
                 Who::Player { ucid, .. } => (ucid, cfg.provisional),
@@ -1290,6 +1458,8 @@ impl Db {
         }
     }
 
+    /// Add `amount` (may be negative) to the player's balance. Non zero adjustments are
+    /// reported to the player and published as a stat, with `why` as the reason.
     pub fn adjust_points(&mut self, ucid: &Ucid, amount: i32, why: &str) {
         if let Some(player) = self.persisted.players.get_mut_cow(ucid) {
             player.points += amount;

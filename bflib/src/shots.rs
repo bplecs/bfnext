@@ -15,6 +15,12 @@ for more details.
 */
 
 //! Lets not bicker and argue about oo killed oo
+//!
+//! Kill attribution. [`ShotDb`] records every shot fired at, and every hit
+//! on, a unit known to the campaign (a campaign spawned AI unit or a player
+//! aircraft), indexed by target. When a target dies its accumulated shots
+//! are packaged into a [`Dead`] record by [`ShotDb::bring_out_your_dead`],
+//! which the main loop uses to log kills and award points.
 use crate::db::{Db, group::DeployKind};
 use anyhow::Result;
 use bfprotocols::shots::{Dead, Shot, Who};
@@ -28,14 +34,23 @@ use dcso3::{
 use fxhash::FxHashMap;
 use std::collections::hash_map::Entry;
 
+/// Shot and hit history used to attribute kills.
 #[derive(Debug, Clone, Default)]
 pub struct ShotDb {
+    /// Shots and hits on each target that is still alive (or whose death has
+    /// not been processed yet).
     by_target: FxHashMap<DcsOid<ClassUnit>, Vec<Shot>>,
+    /// Targets that died since the last [`ShotDb::bring_out_your_dead`], with
+    /// their time of death.
     dead: FxHashMap<DcsOid<ClassUnit>, DateTime<Utc>>,
+    /// Targets processed as dead within the last 5 minutes. Further shots or
+    /// hits on them (e.g. on the wreck) are ignored.
     recently_dead: FxHashMap<DcsOid<ClassUnit>, DateTime<Utc>>,
+    /// Last time stale shots were purged from `by_target`.
     last_gc: DateTime<Utc>,
 }
 
+/// Unwrap a `Result`, or return `Ok(())` from the enclosing fn on error.
 macro_rules! ok {
     ($r:expr) => {
         match $r {
@@ -45,6 +60,7 @@ macro_rules! ok {
     };
 }
 
+/// Unwrap an `Option`, or return `Ok(())` from the enclosing fn on `None`.
 macro_rules! some {
     ($o:expr) => {
         match $o {
@@ -54,6 +70,13 @@ macro_rules! some {
     };
 }
 
+/// Identify the DCS unit `id` for the shot record.
+///
+/// Campaign spawned units resolve to [`Who::AI`], carrying the ucid of the
+/// player responsible for the group if any (actions, deployables, troops).
+/// Otherwise, if the unit is a slot occupied by a registered player, it
+/// resolves to [`Who::Player`]. Returns `None` for units the campaign does
+/// not track.
 fn who(db: &Db, id: DcsOid<ClassUnit>) -> Option<Who> {
     match db.ephemeral.get_uid_by_object_id(&id) {
         Some(uid) => db.unit(uid).ok().map(|u| Who::AI {
@@ -85,12 +108,19 @@ fn who(db: &Db, id: DcsOid<ClassUnit>) -> Option<Who> {
 }
 
 impl ShotDb {
+    /// Mark `target` as dead at `time`. If it is already pending as dead the
+    /// earlier time is kept.
     pub fn dead(&mut self, target: DcsOid<ClassUnit>, time: DateTime<Utc>) {
         if let Entry::Vacant(e) = self.dead.entry(target) {
             e.insert(time);
         }
     }
 
+    /// Record a weapon launch from a DCS shot event against the weapon's
+    /// target. Ignored (returning `Ok`) if the weapon is in the configured
+    /// target exclusions, has no unit target, the target is already dead,
+    /// or either the shooter or target is not tracked by the campaign.
+    /// Errors if a DCS api call fails.
     pub fn shot(&mut self, db: &Db, now: DateTime<Utc>, e: &ShotEvent) -> Result<()> {
         if db.ephemeral.cfg.weapon_target_exclusions.contains(&e.weapon_name) {
             return Ok(())
@@ -115,6 +145,9 @@ impl ShotDb {
         Ok(())
     }
 
+    /// Record a hit on `target` by `shooter` (from a DCS hit or kill event).
+    /// If `dead` is true the target is also marked dead at `now`. Ignored if
+    /// the target is already dead or either unit is not tracked.
     pub fn hit(
         &mut self,
         db: &Db,
@@ -149,11 +182,18 @@ impl ShotDb {
         Ok(())
     }
 
+    /// Drain the targets that died since the last call, returning a [`Dead`]
+    /// record (with every shot and hit on it) for each one that was shot at.
+    /// Targets that died without any recorded shots produce no record.
+    ///
+    /// Also expires `recently_dead` entries older than 5 minutes, and every
+    /// 30 minutes drops shots older than 30 minutes on still living targets.
     pub fn bring_out_your_dead(&mut self, now: DateTime<Utc>) -> Vec<Dead> {
         let mut dead = Vec::with_capacity(self.dead.len());
         for (target, time) in self.dead.drain() {
             if let Some(shots) = self.by_target.remove(&target) {
                 if shots.len() > 0 {
+                    // every shot in the list has the same target
                     let victim = shots[0].target.clone();
                     dead.push(Dead {
                         victim,

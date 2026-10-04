@@ -14,6 +14,22 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Background work that must not run on the DCS simulation thread.
+//!
+//! The mission script runs inside DCS's Lua thread, where any blocking I/O
+//! stalls the simulation. [`init`] spawns a dedicated OS thread running a
+//! multi-threaded tokio runtime, and returns a channel sender. The game side
+//! sends [`Task`]s down that channel (via `Context::do_bg_task`) and
+//! [`background_loop`] executes them: saving and rotating the persisted
+//! campaign state, saving the config, writing log lines, publishing perf
+//! stats, and recording [`Stat`] events.
+//!
+//! Logging starts in file mode (`<writedir>/Logs/bfnext.txt`). Once the
+//! campaign config is loaded, if it specifies a `netidx_base`, the loop
+//! switches to netidx mode: logs, perf counters and stats are published
+//! under `<netidx_base>/<sortie>`, and the admin RPCs in [`rpcs`] are
+//! registered under `<netidx_base>/<sortie>/api`.
+
 mod logpub;
 mod perf;
 mod rpcs;
@@ -68,15 +84,21 @@ use tokio::{
 };
 
 thread_local! {
+    /// Per thread accumulator for partial log lines written by the logger.
     static LOGBUF: RefCell<BytesMut> = RefCell::new(BytesMut::new());
 }
 
+/// The `io::Write` sink handed to simplelog. Rather than writing to disk on
+/// the calling (possibly DCS) thread, complete lines are forwarded to the
+/// background loop as [`Task::WriteLog`].
 struct LogHandle(UnboundedSender<Task>);
 
 impl io::Write for LogHandle {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         LOGBUF.with_borrow_mut(|lbuf| {
             lbuf.extend_from_slice(buf);
+            // the logger may emit a record in several write calls, only ship
+            // the buffer once it ends with a newline so lines stay whole
             if lbuf.len() > 0 && lbuf[lbuf.len() - 1] == 0xA {
                 self.0
                     .send(Task::WriteLog(lbuf.split().freeze()))
@@ -91,6 +113,8 @@ impl io::Write for LogHandle {
     }
 }
 
+/// Serialize `db` to JSON, reusing a thread local buffer to avoid
+/// reallocating for every save/stat.
 fn encode<T: Serialize>(db: &T) -> Result<BytesMut> {
     thread_local! {
         static BUF: RefCell<BytesMut> = RefCell::new(BytesMut::new());
@@ -102,6 +126,15 @@ fn encode<T: Serialize>(db: &T) -> Result<BytesMut> {
     })
 }
 
+/// Move the existing save file at `path` (if any) aside as a timestamped
+/// backup, then thin out old backups.
+///
+/// Backups are named `<file name><unix timestamp in seconds>` and live next
+/// to `path`. Backups are grouped into age buckets (minute, ten minutes,
+/// hour, day, week, 4 week "month", using the coarsest unit the age
+/// exceeds) and only the newest backup in each bucket is kept. Backups less
+/// than a minute old are never deleted. Errors are returned if the path has
+/// no file name/parent or any filesystem operation fails.
 fn rotate_state(path: &Path) -> Result<()> {
     if path.exists() {
         let name = path
@@ -174,6 +207,7 @@ fn rotate_state(path: &Path) -> Result<()> {
             }
         }
         for (_, mut paths) in by_age {
+            // newest first, then pop (delete) from the oldest end until one remains
             paths.sort_by_key(|(ts, _)| *ts);
             paths.reverse();
             while paths.len() > 1 {
@@ -186,6 +220,12 @@ fn rotate_state(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write the encoded campaign state to `path`, zstd compressed (level 9).
+///
+/// The data is first written to `path` with a `.tmp` extension, then the
+/// previous save is rotated into the backups (see [`rotate_state`]) and the
+/// temp file is renamed into place, so a crash mid write never leaves a
+/// truncated save. Rotation failures are logged but don't fail the save.
 async fn save(path: PathBuf, encoded: Bytes) -> Result<()> {
     task::spawn_blocking(move || {
         use std::fs::File;
@@ -208,6 +248,9 @@ async fn save(path: PathBuf, encoded: Bytes) -> Result<()> {
     .await?
 }
 
+/// Rename an existing log file at `path` to `<stem><utc timestamp>.<ext>`
+/// (e.g. `bfnext20240101T120000Z.txt`) so each session starts a fresh log.
+/// Failures are printed to stdout, since the logger isn't usable yet.
 fn rotate_log(path: &Path) {
     if path.exists() {
         let ext = path
@@ -237,41 +280,67 @@ fn rotate_log(path: &Path) {
     }
 }
 
+/// A unit of work sent from the game thread to the background loop.
 #[derive(Debug)]
 pub(super) enum Task {
+    /// Encode and write a snapshot of the persisted campaign state to the
+    /// path, rotating backups, then flush the stats archive.
     SaveState(PathBuf, Persisted),
+    /// Delete the save file at the path (used when the campaign is reset).
     ResetState(PathBuf),
+    /// The campaign config has been loaded. If it has a `netidx_base`, start
+    /// the netidx publisher, register the admin RPCs and switch logging to
+    /// netidx mode, all under `<netidx_base>/<sortie>`.
     CfgLoaded {
         sortie: dcso3::String,
         cfg: Arc<Cfg>,
+        /// Queue the admin RPCs push commands onto. It is drained on the game
+        /// thread by `admin::run_admin_commands`, which answers each command
+        /// through the paired oneshot sender.
         admin_channel: Arc<SegQueue<(AdminCommand, oneshot::Sender<Value>)>>,
     },
+    /// Save the config to the path.
     SaveConfig(PathBuf, Arc<Cfg>),
+    /// One or more complete log lines (sent by [`LogHandle`]).
     WriteLog(Bytes),
+    /// Log the current perf histograms and, in netidx mode, publish them.
     LogPerf {
+        /// Number of connected players.
         players: usize,
         perf: Perf,
         api_perf: ApiPerf,
     },
+    /// Shut down netidx publishing, set the bool to true and notify the
+    /// condvar so the waiting game thread can proceed, then exit the loop.
     Shutdown(Arc<(Mutex<bool>, Condvar)>),
+    /// Record a stat event in the stats archive (ignored in file mode).
     Stat(Stat),
 }
 
+/// Where logs, perf and stats go.
 enum Logs {
+    /// Netidx is configured: the log is published (and still written to the
+    /// log file by [`LogPublisher`]), perf counters are published, and stats
+    /// are recorded to a netidx archive.
     Netidx {
         publisher: Publisher,
         perf: PubPerf,
         stats: Statspub,
         log: LogPublisher,
     },
+    /// No netidx: log lines are written to `log_path`, stats are dropped and
+    /// perf is only written to the log.
     Files {
         log_path: PathBuf,
+        /// `None` only transiently while switching to netidx.
         log_file: Option<File>,
+        /// Directory the stats archive will use if we switch to netidx.
         stats_path: PathBuf,
     },
 }
 
 impl Logs {
+    /// (Re)open the log file in file mode. No-op in netidx mode.
     async fn open_files(&mut self) -> Result<()> {
         match self {
             Self::Netidx { .. } => Ok(()),
@@ -292,6 +361,8 @@ impl Logs {
         }
     }
 
+    /// Start in file mode, logging to `<write_dir>/Logs/bfnext.txt` after
+    /// rotating away any previous log.
     async fn new(write_dir: &Path) -> Result<Self> {
         let stats_path = write_dir.join("Logs").join("stats");
         let log_path = write_dir.join("Logs").join("bfnext.txt");
@@ -305,6 +376,7 @@ impl Logs {
         Ok(t)
     }
 
+    /// Write a log line. Errors if in file mode and the file isn't open.
     async fn write_log(&mut self, buf: Chars) -> Result<()> {
         match self {
             Self::Netidx { log, .. } => log.append(buf),
@@ -316,6 +388,7 @@ impl Logs {
         }
     }
 
+    /// Append a stat to the archive, timestamped now. Dropped in file mode.
     fn write_stat(&mut self, stat: &Stat) -> Result<()> {
         match self {
             Self::Files { .. } => Ok(()),
@@ -323,6 +396,8 @@ impl Logs {
         }
     }
 
+    /// Write perf stats to the log, and in netidx mode publish them as a
+    /// single batch.
     async fn log_perf(&self, players: usize, perf_stat: &PerfStat, api_perf_stat: &ApiPerfStat) {
         perf_stat.log();
         api_perf_stat.log();
@@ -338,6 +413,13 @@ impl Logs {
         }
     }
 
+    /// Switch from file mode to netidx mode, publishing perf under `base`,
+    /// stats under `base/stats` and the log under `base/log`. No-op if
+    /// already in netidx mode.
+    ///
+    /// The log file is closed first because [`LogPublisher`] reopens it for
+    /// appending. If any part of setup fails, the log file is reopened and
+    /// we stay in file mode, returning the error.
     async fn switch_to_netidx(
         &mut self,
         publisher: Publisher,
@@ -394,6 +476,7 @@ impl Logs {
         }
     }
 
+    /// Flush the stats archive to disk (netidx mode only).
     fn flush_stats(&mut self) -> Result<()> {
         match self {
             Self::Files { .. } => Ok(()),
@@ -401,6 +484,8 @@ impl Logs {
         }
     }
 
+    /// Close the log publisher, flush stats and shut down the netidx
+    /// publisher. Errors are ignored since we're exiting anyway.
     async fn shutdown(&mut self) {
         match self {
             Self::Files { .. } => (),
@@ -418,10 +503,16 @@ impl Logs {
     }
 }
 
+/// The main background task. Processes [`Task`]s in order until the channel
+/// closes or a [`Task::Shutdown`] is received. Failures of individual tasks
+/// are logged and do not stop the loop.
+///
+/// Panics if the initial log file can't be opened.
 async fn background_loop(write_dir: PathBuf, mut rx: UnboundedReceiver<Task>) {
     let mut logs = Logs::new(&write_dir)
         .await
         .expect("could not open log files");
+    // held only to keep the rpc procs published, dropping it unpublishes them
     let mut _rpcs: Option<Rpcs> = None;
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -489,6 +580,7 @@ async fn background_loop(write_dir: PathBuf, mut rx: UnboundedReceiver<Task>) {
                 Ok(()) => (),
                 Err(e) => error!("failed to save config {e:?}"),
             },
+            // log write failures go to stderr, logging them would recurse
             Task::WriteLog(buf) => match Chars::from_bytes(buf) {
                 Err(e) => eprintln!("invalid unicode log {e:?}"),
                 Ok(buf) => {
@@ -524,8 +616,15 @@ async fn background_loop(write_dir: PathBuf, mut rx: UnboundedReceiver<Task>) {
     }
 }
 
+/// The sender for the single background loop. The background thread and
+/// global logger are only created once per process, even if the mission is
+/// reloaded and [`init`] is called again.
 static TXCOM: OnceCell<mpsc::UnboundedSender<Task>> = OnceCell::new();
 
+/// Install the global logger, sending its output to the background loop.
+/// The level comes from `RUST_LOG` (trace/debug/info/warn/error/off),
+/// defaulting to debug if unset or unrecognized. Panics if a logger is
+/// already installed.
 fn setup_logger(tx: UnboundedSender<Task>) {
     let level = match env::var("RUST_LOG").ok().map(|s| s.to_ascii_lowercase()) {
         None => LevelFilter::Debug,
@@ -541,6 +640,12 @@ fn setup_logger(tx: UnboundedSender<Task>) {
         .expect("could not init logger")
 }
 
+/// Get the sender for the background loop, starting it on first call.
+///
+/// The first call installs the logger and spawns an OS thread running a
+/// multi-threaded tokio runtime that drives [`background_loop`].
+/// `write_dir` is the DCS write directory (e.g. `Saved Games/DCS`); it is
+/// ignored on subsequent calls.
 pub(super) fn init(write_dir: PathBuf) -> UnboundedSender<Task> {
     match TXCOM.get() {
         Some(tx) => tx.clone(),

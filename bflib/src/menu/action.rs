@@ -1,3 +1,18 @@
+//! The F10 "Actions" menu.
+//!
+//! Actions are side-wide missions configured in the campaign (AI CAP,
+//! AWACS, tankers, deployable drops, nukes, logistics repair, etc). Most
+//! actions need a target location, which the player supplies by placing an
+//! F10 map mark: each of the player's own marks with a unique label of at
+//! most 24 characters becomes a menu entry. Waypoint style actions also
+//! need a target group, chosen from the side's existing action groups (or
+//! deployed groups and troops for `Move`).
+//!
+//! Because the menu contents depend on the player's current marks, the
+//! slot initially only gets an "Actions>>" command; selecting it builds the
+//! full menu (`add_action_menu`). If the player adds a mark while the menu
+//! is expanded, it is collapsed back to "Actions>>" so it gets rebuilt.
+
 use super::{ArgPent, ArgQuad, ArgTriple};
 use crate::{
     Context,
@@ -27,6 +42,9 @@ use dcso3::{
 use fxhash::FxHashMap;
 use std::sync::Arc;
 
+/// Start an action for a player. On success the mark that targeted it (if
+/// any) is deleted and the player's action menu is collapsed back to
+/// "Actions>>".
 fn run_action(
     ctx: &mut Context,
     perf: &mut PerfInner,
@@ -54,6 +72,8 @@ fn run_action(
     init_action_menu_for_slot(ctx, lua, &slot, &ucid)
 }
 
+/// Start an action that targets a map position (`pos`, from the mark).
+/// Fails if the action kind doesn't take just a position.
 fn do_pos_action(
     ctx: &mut Context,
     perf: &mut PerfInner,
@@ -66,6 +86,7 @@ fn do_pos_action(
     mark: MarkId,
     action: Action,
 ) -> Result<()> {
+    // DCS 3d (x, alt, z) to the 2d map plane
     let pos = Vector2::new(pos.0.x, pos.0.z);
     let args = match &action.kind {
         ActionKind::Attackers(cfg) => ActionArgs::Attackers(WithPos {
@@ -125,6 +146,8 @@ fn do_pos_action(
     run_action(ctx, perf, lua, side, slot, ucid, Some(mark), cmd)
 }
 
+/// Look up the player's side, current slot, and the action called `name`
+/// for their side. Fails if the player, slot, or action doesn't exist.
 fn side_slot_action(ctx: &mut Context, ucid: &Ucid, name: &str) -> Result<(Side, SlotId, Action)> {
     let player = ctx
         .db
@@ -149,6 +172,9 @@ fn side_slot_action(ctx: &mut Context, ucid: &Ucid, name: &str) -> Result<(Side,
     Ok((side, slot, action))
 }
 
+/// Menu callback for position actions. `arg` is (player, action name, mark
+/// position, mark id). The outcome is reported to the player in a 10 second
+/// message panel.
 fn run_pos_action(lua: MizLua, arg: ArgQuad<Ucid, String, LuaVec3, MarkId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let perf = Arc::make_mut(&mut unsafe { Perf::get_mut() }.inner);
@@ -181,6 +207,9 @@ fn run_pos_action(lua: MizLua, arg: ArgQuad<Ucid, String, LuaVec3, MarkId>) -> R
     Ok(())
 }
 
+/// Start an action that targets an existing `group` and a map position,
+/// e.g. sending a tanker to a new waypoint or moving deployed units. Fails
+/// if the action kind doesn't take a position and group.
 fn do_pos_group_action(
     ctx: &mut Context,
     perf: &mut PerfInner,
@@ -259,6 +288,9 @@ fn do_pos_group_action(
     run_action(ctx, perf, lua, side, slot, ucid, Some(mark), cmd)
 }
 
+/// Menu callback for position + group actions. `arg` is (player, action
+/// name, mark position, target group, mark id). The outcome is reported to
+/// the player in a 10 second message panel.
 fn run_pos_group_action(
     lua: MizLua,
     arg: ArgPent<Ucid, String, LuaVec3, DbGid, MarkId>,
@@ -295,6 +327,8 @@ fn run_pos_group_action(
     Ok(())
 }
 
+/// Start an action that targets an objective (currently only logistics
+/// repair). Fails for any other action kind.
 fn do_objective_action(
     ctx: &mut Context,
     perf: &mut PerfInner,
@@ -337,6 +371,8 @@ fn do_objective_action(
     run_action(ctx, perf, lua, side, slot, ucid, None, cmd)
 }
 
+/// Menu callback for objective actions. `arg` is (player, action name,
+/// objective). The outcome is reported to the player in a message panel.
 fn run_objective_action(lua: MizLua, arg: ArgTriple<Ucid, String, ObjectiveId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let perf = Arc::make_mut(&mut unsafe { Perf::get_mut() }.inner);
@@ -368,6 +404,15 @@ fn run_objective_action(lua: MizLua, arg: ArgTriple<Ucid, String, ObjectiveId>) 
     Ok(())
 }
 
+/// Callback for the "Actions>>" command: replace it with the full Actions
+/// submenu for the player. `arg` is (player, miz group, slot).
+///
+/// Each configured action for the player's side gets a submenu (titled with
+/// its point cost, if any) listing valid targets: the player's marks,
+/// target groups then marks, or friendly objectives, depending on the
+/// action kind. Bomber and logistics transfer actions are not offered here.
+/// DCS menus hold a limited number of items, so every level is paginated
+/// with "Next>>" submenus after 8 entries.
 fn add_action_menu(lua: MizLua, arg: ArgTriple<Ucid, GroupId, SlotId>) -> Result<()> {
     let ctx = unsafe { Context::get_mut() };
     let mc = MissionCommands::singleton(lua)?;
@@ -385,9 +430,11 @@ fn add_action_menu(lua: MizLua, arg: ArgTriple<Ucid, GroupId, SlotId>) -> Result
         .actions
         .get(&player.side)
         .ok_or_else(|| anyhow!("no actions for {}", player.side))?;
+    /// a player mark, keyed by its text in `marks`
     struct Mk {
         id: MarkId,
         pos: Vector3,
+        /// how many of the player's marks have this text
         count: usize,
     }
     let mut marks: FxHashMap<String, Mk> = FxHashMap::default();
@@ -409,6 +456,7 @@ fn add_action_menu(lua: MizLua, arg: ArgTriple<Ucid, GroupId, SlotId>) -> Result
             }
         }
     }
+    // marks with duplicate text would be ambiguous menu entries
     marks.retain(|_, mk| mk.count == 1);
     let add_pos = |root: GroupSubMenu, name: String| -> Result<()> {
         for (text, mk) in &marks {
@@ -427,6 +475,8 @@ fn add_action_menu(lua: MizLua, arg: ArgTriple<Ucid, GroupId, SlotId>) -> Result
         }
         Ok(())
     };
+    // if `action` the candidate groups are the side's action groups,
+    // otherwise its deployed groups and troops
     let add_pos_group = |mut root: GroupSubMenu, name: String, action: bool| -> Result<()> {
         let iter: Box<dyn Iterator<Item = &DbGid>> = if action {
             Box::new(ctx.db.persisted.actions.into_iter())
@@ -573,10 +623,13 @@ fn add_action_menu(lua: MizLua, arg: ArgTriple<Ucid, GroupId, SlotId>) -> Result
         }
         n += 1;
     }
+    // the menu is now expanded, so it must be reset when new marks appear
     ctx.subscribed_action_menus.insert(arg.trd);
     Ok(())
 }
 
+/// Reset the slot's action menu to the single collapsed "Actions>>"
+/// command, which builds the full menu when selected.
 pub(crate) fn init_action_menu_for_slot(
     ctx: &mut Context,
     lua: MizLua,

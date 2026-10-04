@@ -1,3 +1,12 @@
+//! Netidx publication of performance counters.
+//!
+//! bflib keeps latency histograms for its own work ([`PerfStat`], e.g. frame
+//! time, spawning, logistics) and for calls into the DCS API
+//! ([`ApiPerfStat`], e.g. `getPosition`, `land.getHeight`). In netidx mode
+//! the background loop periodically (on [`super::Task::LogPerf`]) publishes
+//! a summary of each histogram under `<base>/perf/<name>/...`, along with the
+//! player count and logistics item count directly under `<base>`.
+
 use anyhow::Result;
 use bfprotocols::perf::PerfStat;
 use dcso3::perf::{HistStat, PerfStat as ApiPerfStat};
@@ -6,7 +15,10 @@ use netidx::{
     publisher::{Publisher, UpdateBatch, Val},
 };
 
+/// The published summary of one histogram, at `<base>/<name>/{unit, n,
+/// mean, 25th, 50th, 90th, 99th, 99.9th}`.
 struct PubHistStat {
+    /// Published once at creation and never updated.
     _unit: Val,
     n: Val,
     mean: Val,
@@ -18,6 +30,7 @@ struct PubHistStat {
 }
 
 impl PubHistStat {
+    /// Publish the summary of `stat` under `base/<stat.name>`.
     fn new(publisher: &Publisher, base: &Path, stat: &HistStat) -> Result<Self> {
         let HistStat {
             name,
@@ -43,6 +56,7 @@ impl PubHistStat {
         })
     }
 
+    /// Queue updates for any values that changed into `batch`.
     fn update(&self, batch: &mut UpdateBatch, stat: &HistStat) {
         let Self {
             _unit: _,
@@ -64,7 +78,12 @@ impl PubHistStat {
     }
 }
 
+/// Published values for every bflib and DCS API perf histogram. There is one
+/// field per field of [`PerfStat`] and [`ApiPerfStat`]; the exhaustive
+/// destructuring in [`PubPerf::new`] and [`PubPerf::update`] makes adding a
+/// histogram a compile error until it is handled here.
 pub struct PubPerf {
+    /// Number of connected players.
     players: Val,
     logistics_items: Val,
     frame: PubHistStat,
@@ -114,6 +133,8 @@ pub struct PubPerf {
 }
 
 impl PubPerf {
+    /// Publish the initial values: `players` and `logistics_items` directly
+    /// under `base`, histograms under `base/perf`.
     pub fn new(
         publisher: &Publisher,
         base: &Path,
@@ -223,6 +244,8 @@ impl PubPerf {
         })
     }
 
+    /// Queue updates for all changed values into `batch`. The caller commits
+    /// the batch.
     pub fn update(
         &self,
         batch: &mut UpdateBatch,

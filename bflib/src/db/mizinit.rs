@@ -14,6 +14,15 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Building campaign state from the mission file.
+//!
+//! [`Db::init`] creates a brand new campaign from the miz: objectives and
+//! their groups are discovered from specially named trigger zones, and
+//! player slots are associated with the objective they sit in.
+//! [`Db::respawn_after_load`] runs when an existing campaign is loaded from
+//! disk; it rebuilds slot info, respawns everything that should be in the
+//! world, sets up warehouses, and redraws all the F10 map markup.
+
 use std::sync::Arc;
 
 use super::{Db, ephemeral::SlotInfo, group::DeployKind, objective::ObjGroup};
@@ -71,6 +80,10 @@ impl Db {
     /// - N: Neutral
     ///
     /// So e.g. Tblisi would be OABBTBLISI -> Objective, Airbase, Default to Blue, named Tblisi
+    ///
+    /// Note: the parser currently only accepts AB, FO, and LO; SA is rejected.
+    /// `name` is passed in with the leading O already stripped. The only
+    /// zone property allowed is LOGISTICS_DETACHED (true/false).
     fn init_objective(&mut self, lua: MizLua, zone: TriggerZone, name: &str) -> Result<()> {
         fn side_and_name(s: &str) -> Result<(Side, String)> {
             if let Some(name) = s.strip_prefix("R") {
@@ -167,6 +180,9 @@ impl Db {
     /// e.g. GRIRSRAD#001 would be the 1st instantiation of the template RIRSRAD, which must
     /// correspond to a group in the miz file. There is one special template name called (R|B|N)LOGI
     /// which corresponds to the logistics template for objectives
+    ///
+    /// If the group's side differs from the objective's owner its units are
+    /// created dead, so they will only appear if that side captures it.
     fn init_objective_group(
         &mut self,
         spctx: &SpawnCtx,
@@ -215,6 +231,12 @@ impl Db {
         Ok(())
     }
 
+    /// Record [`SlotInfo`] for each client (player) unit in the aircraft
+    /// group `slot`, associating it with the objective whose zone contains it.
+    ///
+    /// Fails if any unit type in the group has no configured threat distance
+    /// or life type. If a client unit isn't inside any objective, it is
+    /// logged and the rest of the group is skipped.
     pub fn init_objective_slots(&mut self, side: Side, slot: Group) -> Result<()> {
         let mut ground_start = false;
         for point in slot.route()?.points()? {
@@ -272,6 +294,11 @@ impl Db {
         Ok(())
     }
 
+    /// Create a new campaign from the miz and config.
+    ///
+    /// Objective zones (O prefix) are processed first, so that group zones
+    /// (G prefix) and slots can then be matched to the objective containing
+    /// them. Any trigger zone without an O, G, or T prefix is an error.
     pub fn init(
         lua: MizLua,
         cfg: Arc<Cfg>,
@@ -287,6 +314,7 @@ impl Db {
             let zone = zone?;
             let name = zone.name()?;
             if name.starts_with('O') {
+                // O + 2 char type + 1 char side + at least one char of name
                 if name.len() > 4 {
                     if !objective_names.insert(CompactString::from(&name[3..])) {
                         bail!("duplicate objective name {name}")
@@ -304,6 +332,9 @@ impl Db {
                 let zone = zone?;
                 let name = zone.name()?;
                 if let Some(name) = name.strip_prefix("G") {
+                    // zones naming a sided template are created only in that
+                    // side's pass; unsided ones get a group for every side
+                    // (only the owner's stays alive, see init_objective_group)
                     let (template_side, name) = name.parse::<ObjGroup>()?.template(side);
                     if template_side == side {
                         t.init_objective_group(&spctx, idx, miz, zone, side, name.as_str())?
@@ -333,6 +364,7 @@ impl Db {
             .into_iter()
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
+        // compute initial health/logi etc now that all groups exist
         for id in ids {
             t.update_objective_status(&id, now)?
         }
@@ -341,6 +373,15 @@ impl Db {
         Ok(t)
     }
 
+    /// Bring the DCS world in line with a campaign that was just loaded from
+    /// disk (or created by [`Db::init`]).
+    ///
+    /// Migrates old persisted formats, rebuilds slot info, respawns deployed
+    /// groups, crates, troops, actions, farp pads, and objective groups that
+    /// should be present, then sets up warehouses, draws all markup, queues
+    /// every living unit for an enemy proximity check, and does an initial
+    /// cull/respawn pass. Players who were airborne at the last shutdown get
+    /// the life they spent refunded.
     pub fn respawn_after_load(
         &mut self,
         lua: MizLua,
@@ -416,6 +457,7 @@ impl Db {
             }
             debug!("respawning farps");
             for (_, obj) in self.persisted.objectives.iter_mut_cow() {
+                // threat checks use a point 50m above the objective's ground
                 let pos = obj.zone.pos();
                 let alt = land.get_height(LuaVec2(pos))? + 50.;
                 obj.threat_pos3 = Vector3::new(pos.x, alt, pos.y);
@@ -425,6 +467,8 @@ impl Db {
                     pad_template,
                 } = &obj.kind
                 {
+                    // pads tracked as units are respawned normally, otherwise
+                    // the pad template is spawned directly at the farp
                     if let Some(uid) = self.persisted.units_by_name.get(pad_template)
                         && let Some(unit) = self.persisted.units.get(uid)
                     {
@@ -436,6 +480,8 @@ impl Db {
                     }
                     self.ephemeral.set_pad_template_used(pad_template.clone());
                 }
+                // other objective groups are spawned on demand by the cull
+                // logic, but farp groups and services are always present
                 if let Some(groups) = obj.groups.get(&obj.owner) {
                     for gid in groups {
                         let group = group!(self, gid)?;
@@ -509,6 +555,8 @@ impl Db {
             player.airborne = None;
             if let Some((_, lives)) = player.lives.get_mut_cow(&lt) {
                 *lives += 1;
+                // back at the default means no lives are spent, so the entry
+                // can be dropped
                 if *lives >= self.ephemeral.cfg.default_lives[&lt].0 {
                     player.lives.remove_cow(&lt);
                 }

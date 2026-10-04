@@ -14,6 +14,22 @@ FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero Public License
 for more details.
 */
 
+//! Warehouse logistics.
+//!
+//! When the campaign config has a `warehouse` section, every objective has a
+//! [`Warehouse`] of equipment (airframes, weapons) and liquids (fuel) that
+//! mirrors its DCS airbase warehouse. Each side's production is read from a
+//! supply source warehouse in the miz at startup. On every logistics tick
+//! (`tick` minutes) the hubs distribute stock to the objectives they supply
+//! (each objective is supplied by its nearest friendly hub), and stock is
+//! then balanced between hubs. Once `ticks_per_delivery` ticks have passed
+//! since the last delivery, one delivery of production is first added to
+//! each side's hubs.
+//!
+//! The work is spread across frames by a state machine ([`LogiStage`]) driven
+//! by [`Db::logistics_step`]: read DCS warehouses into the db, compute
+//! transfers, execute them, then write the db back to the DCS warehouses.
+
 use super::{
     ephemeral::{Equipment, Production},
     objective::Objective,
@@ -52,20 +68,31 @@ use std::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+/// The state of the logistics state machine. Each call to
+/// [`Db::logistics_step`] does a small amount of work and may advance the
+/// stage. A normal tick runs Complete -> SyncFromWarehouses ->
+/// ExecuteTransfers -> SyncToWarehouses -> Complete.
 #[derive(Debug, Clone)]
 pub enum LogiStage {
+    /// Idle until `tick` minutes after `last_tick`
     Complete {
         last_tick: DateTime<Utc>,
     },
+    /// Reading DCS warehouse inventories into the db, one objective per step.
+    /// When empty, transfers are computed.
     SyncFromWarehouses {
         objectives: SmallVec<[ObjectiveId; 128]>,
     },
+    /// Writing db inventories out to the DCS warehouses, one objective per step
     SyncToWarehouses {
         objectives: SmallVec<[ObjectiveId; 128]>,
     },
+    /// Executing pending transfers within a time budget per step. When empty
+    /// the logistics hubs are balanced.
     ExecuteTransfers {
         transfers: Vec<Transfer>,
     },
+    /// Startup. Moves straight to syncing the db to the DCS warehouses.
     Init,
 }
 
@@ -75,6 +102,8 @@ impl Default for LogiStage {
     }
 }
 
+/// The stock of one item in a warehouse. `+=` clamps to `capacity`, `-=`
+/// clamps to 0.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Inventory {
     pub stored: u32,
@@ -82,6 +111,8 @@ pub struct Inventory {
 }
 
 impl Inventory {
+    /// The percent (capped at 100) of capacity stored, or None if the
+    /// capacity is 0.
     pub fn percent(&self) -> Option<u8> {
         if self.capacity == 0 {
             None
@@ -92,6 +123,8 @@ impl Inventory {
         }
     }
 
+    /// Remove `percent` (a fraction from 0 to 1) of the stored amount, but at
+    /// least 1 if anything is stored. Returns the amount removed.
     pub fn reduce(&mut self, percent: f32) -> u32 {
         if self.stored == 0 {
             0
@@ -124,12 +157,14 @@ impl SubAssign<u32> for Inventory {
     }
 }
 
+/// The item a [`Transfer`] moves
 #[derive(Debug, Clone)]
 enum TransferItem {
     Equipment(String),
     Liquid(LiquidType),
 }
 
+/// A pending move of `amount` of `item` from `source` to `target`
 #[derive(Debug, Clone)]
 pub struct Transfer {
     source: ObjectiveId,
@@ -139,6 +174,9 @@ pub struct Transfer {
 }
 
 impl Transfer {
+    /// Apply the transfer to the db (not the DCS warehouses) and publish the
+    /// new inventory of both objectives as stats. Fails if either objective
+    /// doesn't exist.
     fn execute(&self, db: &mut Persisted, to_bg: &Option<UnboundedSender<Task>>) -> Result<()> {
         let src = db
             .objectives
@@ -204,22 +242,29 @@ impl Transfer {
     }
 }
 
+/// An objective's demand for one item while a hub's stock is being allocated
 struct Needed<'a> {
     oid: &'a ObjectiveId,
     obj: &'a Objective,
+    /// capacity - stored
     demanded: u32,
     allocated: u32,
 }
 
+/// The db side copy of an objective's warehouse
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Warehouse {
+    /// Currently unused
     pub(super) base_equipment: Map<String, Inventory>,
     pub(super) equipment: Map<String, Inventory>,
     pub(super) liquids: MapS<LiquidType, Inventory>,
+    /// The logistics hub that supplies this objective, if any
     pub(super) supplier: Option<ObjectiveId>,
+    /// For logistics hubs, the objectives this hub supplies
     pub(super) destination: SetS<ObjectiveId>,
 }
 
+/// Write the db inventory of `obj` to its DCS warehouse
 fn sync_obj_to_warehouse(obj: &Objective, warehouse: &warehouse::Warehouse) -> Result<()> {
     let perf = unsafe { Perf::get_mut() };
     let perf = Arc::make_mut(&mut perf.inner);
@@ -237,6 +282,8 @@ fn sync_obj_to_warehouse(obj: &Objective, warehouse: &warehouse::Warehouse) -> R
     Ok(())
 }
 
+/// Read the stored amounts of the items `obj` tracks from its DCS warehouse.
+/// Capacities are not changed.
 fn sync_warehouse_to_obj(obj: &mut Objective, warehouse: &warehouse::Warehouse) -> Result<()> {
     for (name, inv) in obj.warehouse.equipment.iter_mut_cow() {
         inv.stored = warehouse.get_item_count(name.clone())?;
@@ -247,6 +294,7 @@ fn sync_warehouse_to_obj(obj: &mut Objective, warehouse: &warehouse::Warehouse) 
     Ok(())
 }
 
+/// Get the warehouse of the airbase named `template` (a side's supply source)
 fn get_supplier<'lua>(lua: MizLua<'lua>, template: String) -> Result<warehouse::Warehouse<'lua>> {
     Airbase::get_by_name(lua, template.clone())
         .with_context(|| format_compact!("getting airbase {}", template))?
@@ -255,6 +303,10 @@ fn get_supplier<'lua>(lua: MizLua<'lua>, template: String) -> Result<warehouse::
 }
 
 impl Db {
+    /// Build each side's production (the per delivery amount of every item)
+    /// from the contents of its `supply_source` warehouse, if it hasn't been
+    /// built yet. Also checks that every produced aircraft has a threatened
+    /// distance and life type configured.
     fn init_resource_map(&mut self, lua: MizLua) -> Result<()> {
         let whcfg = match self.ephemeral.cfg.warehouse.as_ref() {
             None => return Ok(()),
@@ -303,6 +355,8 @@ impl Db {
         Ok(())
     }
 
+    /// Set up an empty warehouse for a new FARP, with airbase capacity for
+    /// everything its owner produces.
     pub(super) fn init_farp_warehouse(&mut self, oid: &ObjectiveId) -> Result<()> {
         let whcfg = match self.ephemeral.cfg.warehouse.as_ref() {
             Some(cfg) => cfg,
@@ -330,6 +384,10 @@ impl Db {
         Ok(())
     }
 
+    /// Initialize the warehouses of every objective for a new campaign,
+    /// filled to capacity for everything the owner produces. Capacity is the
+    /// production amount times `hub_max` for logistics hubs or
+    /// `airbase_max` otherwise.
     pub(super) fn init_warehouses(&mut self, lua: MizLua) -> Result<()> {
         self.init_resource_map(lua)
             .context("initializing resource map")?;
@@ -370,6 +428,14 @@ impl Db {
         Ok(())
     }
 
+    /// Called after the db is loaded. Associates each DCS airbase with the
+    /// objective whose zone contains it (disabling auto capture and setting
+    /// its coalition), zeroes the equipment of airbases outside any objective
+    /// (except FARP pad templates), and adjusts objective warehouses for
+    /// changes in production since the save (removing items no longer
+    /// produced and updating capacities). Then updates supply status and
+    /// supply lines. Fails if an objective has no airbase, or has more than
+    /// one.
     pub(super) fn setup_warehouses_after_load(&mut self, lua: MizLua) -> Result<()> {
         self.init_resource_map(lua)
             .context("initializing resource map")?;
@@ -487,6 +553,7 @@ impl Db {
         Ok(())
     }
 
+    /// Make the next logistics tick start immediately (if idle)
     pub fn admin_tick_now(&mut self) {
         match &mut self.ephemeral.logistics_stage {
             LogiStage::Init
@@ -499,11 +566,15 @@ impl Db {
         }
     }
 
+    /// Make the next logistics tick start immediately and deliver production
     pub fn admin_deliver_now(&mut self) {
         self.admin_tick_now();
         self.persisted.logistics_ticks_since_delivery = u32::MAX;
     }
 
+    /// Advance the logistics state machine by one step (see [`LogiStage`]).
+    /// Called frequently, each call does a bounded amount of work. Does
+    /// nothing if the warehouse system isn't configured.
     pub fn logistics_step(
         &mut self,
         lua: MizLua,
@@ -543,6 +614,7 @@ impl Db {
                         record_perf(&mut perf.logistics_sync_from, start_ts);
                     }
                     None => {
+                        // all warehouses are read, decide what moves this tick
                         let sts = Utc::now();
                         let transfers = if self.persisted.logistics_ticks_since_delivery
                             >= ticks_per_delivery
@@ -590,6 +662,7 @@ impl Db {
                         if let Err(e) = tr.execute(&mut self.persisted, &self.ephemeral.to_bg) {
                             error!("executing transfer {:?} {e:?}", tr)
                         }
+                        // limit the time spent per frame, the rest run next step
                         if Utc::now() - st > Duration::milliseconds(6) {
                             break;
                         }
@@ -612,6 +685,10 @@ impl Db {
         Ok(())
     }
 
+    /// Convert a just captured objective's warehouse to its new owner. Items
+    /// the new owner produces get the owner's capacity (existing stock is
+    /// kept). Items only the other side produces are emptied and get zero
+    /// capacity.
     pub(super) fn capture_warehouse(&mut self, lua: MizLua, oid: ObjectiveId) -> Result<()> {
         let whcfg = match self.ephemeral.cfg.warehouse.as_ref() {
             Some(cfg) => cfg,
@@ -662,6 +739,8 @@ impl Db {
         Ok(())
     }
 
+    /// The nearest logistics hub with the same owner as `obj`, or None if
+    /// there is none or `obj` is detached from logistics.
     pub(super) fn compute_supplier(&self, obj: &Objective) -> Result<Option<ObjectiveId>> {
         Ok(self
             .persisted
@@ -685,6 +764,9 @@ impl Db {
             .map(|(_, id)| id))
     }
 
+    /// Recompute which hub supplies each non hub objective, rebuilding every
+    /// hub's `destination` set. Hubs whose destinations changed get their
+    /// map markup redrawn.
     pub fn setup_supply_lines(&mut self) -> Result<()> {
         let mut suppliers: SmallVec<[(ObjectiveId, Option<ObjectiveId>); 64]> = smallvec![];
         for (oid, obj) in &self.persisted.objectives {
@@ -720,6 +802,8 @@ impl Db {
         Ok(())
     }
 
+    /// Add one delivery of each side's production to its logistics hubs
+    /// (clamped to capacity), then compute the hub to objective transfers.
     pub fn deliver_production(&mut self) -> Result<Vec<Transfer>> {
         if self.ephemeral.cfg.warehouse.is_none() {
             return Ok(vec![]);
@@ -756,6 +840,8 @@ impl Db {
             .context("delivering supplies from logistics hubs")
     }
 
+    /// Refresh the db's stored count of one vehicle type at an objective from
+    /// its DCS warehouse. Does nothing if the objective doesn't track it.
     pub fn sync_vehicle_at_obj(
         &mut self,
         lua: MizLua,
@@ -775,6 +861,14 @@ impl Db {
         Ok(())
     }
 
+    /// Compute transfers from each logistics hub to the friendly objectives it
+    /// supplies that are below 100% supply or fuel. Transfers are computed,
+    /// not executed.
+    ///
+    /// For each item the hub has, the destinations are sorted by how much
+    /// they have (least first) and the hub's stock is handed out round robin
+    /// in chunks of 1/8th of what remains, until the stock runs out or all
+    /// demand (capacity - stored) is met.
     pub fn deliver_supplies_from_logistics_hubs(&mut self) -> Result<Vec<Transfer>> {
         self.update_supply_status()
             .context("updating supply status")?;
@@ -850,6 +944,9 @@ impl Db {
         Ok(transfers)
     }
 
+    /// Even out stock between each side's logistics hubs (if it has at least
+    /// two), moving items from hubs above the mean to hubs below it. Unlike
+    /// the other transfers these are executed immediately.
     fn balance_logistics_hubs(&mut self) -> Result<()> {
         struct Needed<'a> {
             oid: &'a ObjectiveId,
@@ -895,9 +992,12 @@ impl Db {
                                 .sum();
                             sum / needed.len() as u32
                         };
+                        // too little stock to be worth balancing
                         if mean >> 2 == 0 {
                             continue;
                         }
+                        // fill the poorest hubs (from the front) by taking from
+                        // the richest (from the back)
                         needed.sort_by(|n0, n1| n0.had.cmp(&n1.had));
                         let mut take = needed.len() - 1;
                         for i in 0..needed.len() {
@@ -939,6 +1039,9 @@ impl Db {
         Ok(())
     }
 
+    /// Recompute every objective's `supply` and `fuel` percentages as the
+    /// average fill percent of its equipment and liquids (items with zero
+    /// capacity are ignored), publishing a stat when they change.
     fn update_supply_status(&mut self) -> Result<()> {
         for (_, obj) in self.persisted.objectives.iter_mut_cow() {
             let current_supply = obj.supply;
@@ -973,6 +1076,8 @@ impl Db {
         Ok(())
     }
 
+    /// Read an objective's DCS warehouse into the db. Returns the objective
+    /// and the warehouse handle. Fails if the objective has no airbase.
     pub fn sync_warehouse_to_objective<'lua>(
         &mut self,
         lua: MizLua<'lua>,
@@ -992,6 +1097,9 @@ impl Db {
         Ok((obj, warehouse))
     }
 
+    /// Write an objective's db inventory to its DCS warehouse. Returns the
+    /// objective and the warehouse handle. Fails if the objective has no
+    /// airbase.
     pub fn sync_objective_to_warehouse<'lua>(
         &mut self,
         lua: MizLua<'lua>,
@@ -1011,6 +1119,10 @@ impl Db {
         Ok((obj, warehouse))
     }
 
+    /// Move supplies between two friendly objectives (a supply transfer
+    /// crate). For every item `from` has, move `supply_transfer_size` percent
+    /// of its stock (at least 1), limited to the space left at `to`. Both
+    /// warehouses are synced from DCS first and written back afterward.
     pub fn transfer_supplies(
         &mut self,
         lua: MizLua,
@@ -1075,6 +1187,8 @@ impl Db {
         Ok(())
     }
 
+    /// Admin command to remove `amount` percent (0-100) of every produced
+    /// item from an objective's inventory, syncing with DCS before and after.
     pub fn admin_reduce_inventory(
         &mut self,
         lua: MizLua,
@@ -1113,6 +1227,9 @@ impl Db {
         Ok(())
     }
 
+    /// Admin command to write an objective's inventory to the log, either as
+    /// seen by DCS (non zero items only) or as recorded in the db
+    /// (stored/capacity).
     pub fn admin_log_inventory(
         &mut self,
         lua: MizLua,
