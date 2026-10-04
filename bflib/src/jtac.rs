@@ -957,8 +957,9 @@ impl Jtac {
     ///
     /// `n` is `[magazine_expend, per_target]`: magazine_expend 1/2/4 spends a
     /// quarter/half/all of the missiles, per_target is 1, 2 or 4. Panics if
-    /// `n` has fewer than two elements. The budget is computed from the
-    /// missile count of the group's last unit. The mission is pushed onto
+    /// `n` has fewer than two elements. The budget is computed from the total
+    /// missile count of the group's units, and the mission aborts if any unit
+    /// has fewer than `per_target` missiles. The mission is pushed onto
     /// the group's task stack (not replacing its current task) and also
     /// gives the group unlimited fuel. Errors if there is no target.
     pub fn alcm_mission(
@@ -991,20 +992,22 @@ impl Jtac {
                 };
 
                 let mut allocated_ammo = {
-                    let mut ammo = 0;
+                    // total missiles across every unit in the group
+                    let mut ammo: u32 = 0;
                     for i in db.group(gid)?.units.into_iter() {
                         let first = Unit::get_by_name(lua, &db.unit(i)?.name)?
                             .get_ammo()?
                             .first();
-                        ammo = match first {
-                            Ok(ammo) => ammo.count()? as u8,
+                        let unit_ammo = match first {
+                            Ok(ammo) => ammo.count()?,
                             Err(_e) => bail! {"ALCM Abort: {gid} is out of missiles."},
                         };
-                        if ammo < per_target {
+                        if unit_ammo < per_target as u32 {
                             bail!(
-                                "ALCM Abort: {gid} has only {ammo} missiles remaining, cannot launch {per_target}."
+                                "ALCM Abort: {gid} has only {unit_ammo} missiles remaining, cannot launch {per_target}."
                             );
                         }
+                        ammo = ammo.saturating_add(unit_ammo);
                     }
 
                     let ammo = match expend {
@@ -1026,8 +1029,8 @@ impl Jtac {
                 info!("allocated ammo: {} {}", allocated_ammo, per_target);
 
                 for (_, target) in &self.contacts {
-                    if allocated_ammo >= per_target {
-                        allocated_ammo -= per_target;
+                    if allocated_ammo >= per_target as u32 {
+                        allocated_ammo -= per_target as u32;
                     } else {
                         break;
                     }
@@ -1856,12 +1859,21 @@ impl Jtacs {
             let detected = detected.entry(id).or_default();
             let tags = db.ephemeral.cfg.unit_classification[&inst.typ];
             if !tags.contains(jtac.filter) {
-                if let Err(e) = jtac.remove_contact(lua, db, &id) {
-                    warn!("could not filter player contact {ucid} {e:?}")
+                match jtac.remove_contact(lua, db, &id) {
+                    Err(e) => warn!("could not filter player contact {ucid} {e:?}"),
+                    Ok(false) => (),
+                    Ok(true) => lost_targets.push((jtac.side, jtac.gid, None)),
                 }
                 continue;
             }
+            // airborne fixed wing players can't be contacts, drop them if they
+            // were one before taking off (the unit loop does the same)
             if inst.in_air && !tags.contains(UnitTag::Helicopter) {
+                match jtac.remove_contact(lua, db, &id) {
+                    Err(e) => warn!("could not remove airborne jtac contact {ucid} {e:?}"),
+                    Ok(false) => (),
+                    Ok(true) => lost_targets.push((jtac.side, jtac.gid, None)),
+                }
                 continue;
             }
             let dist = na::distance_squared(&pos.into(), &inst.position.p.0.into());
