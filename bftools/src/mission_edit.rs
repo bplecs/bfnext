@@ -144,7 +144,7 @@ impl TriggerZone {
     pub fn contains(&self, v: Vector2) -> Result<bool> {
         let pos = self.inner.pos()?;
         match self.inner.typ()? {
-            TriggerZoneTyp::Quad(q) => Ok(q.contains(LuaVec2(pos))),
+            TriggerZoneTyp::Quad(q) => Ok(q.contains(LuaVec2(v))),
             TriggerZoneTyp::Circle { radius } => Ok(radius >= na::distance(&v.into(), &pos.into())),
         }
     }
@@ -219,7 +219,8 @@ impl UnpackedMiz {
 }
 
 /// Formats a Lua value as Lua source, in the layout the mission editor uses
-/// (`[key] = value,` per line, tables indented 4 spaces per level).
+/// (`[key] = value,` per line, tables indented 4 spaces per level). Strings
+/// are escaped; any bytes that aren't valid UTF-8 are replaced.
 /// Functions, threads, userdata, and errors can't be serialized and panic,
 /// which [`serialize_to_lua`] turns into an error.
 struct LuaSerVal {
@@ -244,7 +245,23 @@ impl Display for LuaSerVal {
             Value::Integer(i) => write!(f, "{i}"),
             Value::Nil => write!(f, "nil"),
             Value::Number(n) => write!(f, "{n}"),
-            Value::String(s) => write!(f, "\"{}\"", s.to_string_lossy()),
+            Value::String(s) => {
+                // escape so the result is always a valid Lua string literal
+                write!(f, "\"")?;
+                for c in s.to_string_lossy().chars() {
+                    match c {
+                        '\\' => write!(f, "\\\\")?,
+                        '"' => write!(f, "\\\"")?,
+                        '\n' => write!(f, "\\n")?,
+                        '\r' => write!(f, "\\r")?,
+                        // other control characters as \ddd, always 3 digits so
+                        // a following digit isn't read as part of the escape
+                        c if c.is_ascii_control() => write!(f, "\\{:03}", c as u32)?,
+                        c => write!(f, "{c}")?,
+                    }
+                }
+                write!(f, "\"")
+            }
             Value::Table(tbl) => {
                 macro_rules! write_elt {
                     ($k:expr, $v:expr) => {
