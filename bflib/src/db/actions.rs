@@ -583,7 +583,7 @@ impl Db {
             ActionArgs::SeadWaypoint(args) => {
                 self.move_ai_sead(spctx, side, ucid.clone(), args)?
             }
-            ActionArgs::Rtb(args) => self.rtb(spctx, args).context("rtbing unit")?,
+            ActionArgs::Rtb(args) => self.rtb(spctx, side, args).context("rtbing unit")?,
             ActionArgs::Drone(args) => self
                 .drone(perf, spctx, idx, side, ucid.clone(), name, cmd.action, args)
                 .context("calling drone")?,
@@ -1315,9 +1315,18 @@ impl Db {
     }
 
     /// Send action aircraft `args.group` home to the airbase nearest
-    /// `args.pos`. See [`Db::ai_rtb_mission`].
-    fn rtb(&mut self, spctx: &SpawnCtx, mut args: WithPosAndGroup<()>) -> Result<Option<GroupId>> {
+    /// `args.pos`. Errors if the group belongs to the other side. See
+    /// [`Db::ai_rtb_mission`].
+    fn rtb(
+        &mut self,
+        spctx: &SpawnCtx,
+        side: Side,
+        mut args: WithPosAndGroup<()>,
+    ) -> Result<Option<GroupId>> {
         let gid = args.group;
+        if group!(self, gid)?.side != side {
+            bail!("can't rtb an enemy unit")
+        }
         let mission = self
             .ai_rtb_mission(&mut args, || Task::ComboTask(vec![]))
             .context("generate rtb mission")?;

@@ -254,9 +254,9 @@ impl FromStr for AdminCommand {
                     to: to.into(),
                 }),
             }
-        } else if let Some(_) = s.strip_prefix("tick") {
+        } else if s.trim() == "tick" {
             Ok(Self::LogisticsTickNow)
-        } else if let Some(_) = s.strip_prefix("deliver") {
+        } else if s.trim() == "deliver" {
             Ok(Self::LogisticsDeliverNow)
         } else if let Some(s) = s.strip_prefix("repair ") {
             Ok(Self::Repair { airbase: s.into() })
@@ -320,9 +320,9 @@ impl FromStr for AdminCommand {
             Ok(Self::Unban { player: s.into() })
         } else if let Some(s) = s.strip_prefix("kick ") {
             Ok(Self::Kick { player: s.into() })
-        } else if let Some(_) = s.strip_prefix("connected") {
+        } else if s.trim() == "connected" {
             Ok(Self::Connected)
-        } else if let Some(_) = s.strip_prefix("banned") {
+        } else if s.trim() == "banned" {
             Ok(Self::Banned)
         } else if let Some(s) = s.strip_prefix("search ") {
             Ok(Self::Search {
@@ -336,11 +336,11 @@ impl FromStr for AdminCommand {
                     airbase: String::from(airbase),
                 }),
             }
-        } else if let Some(_) = s.strip_prefix("log-desc") {
+        } else if s.trim() == "log-desc" {
             Ok(Self::Logdesc)
         } else if let Some(s) = s.strip_prefix("reset-lives ") {
             Ok(Self::ResetLives { player: s.into() })
-        } else if let Some(_) = s.strip_prefix("shutdown") {
+        } else if s.trim() == "shutdown" {
             Ok(Self::Shutdown)
         } else if let Some(s) = s.strip_prefix("add-admin ") {
             Ok(Self::AddAdmin { player: s.into() })
@@ -364,12 +364,14 @@ impl FromStr for AdminCommand {
             Ok(Self::Remark {
                 objective: s.into(),
             })
-        } else if let Some(s) = s.strip_prefix("reset") {
+        } else if let Some(rest) = s.strip_prefix("reset") {
             // an optional winning side may follow, e.g. `reset blue`
-            let winner = if s == "" {
-                None
-            } else {
-                Some(Side::from_str(s)?)
+            let winner = match rest.trim_end() {
+                "" => None,
+                rest => match rest.strip_prefix(' ') {
+                    Some(side) => Some(Side::from_str(side.trim())?),
+                    None => bail!("unknown command {s}"),
+                },
             };
             Ok(Self::Reset { winner })
         } else {

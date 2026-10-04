@@ -340,7 +340,8 @@ enum Logs {
 }
 
 impl Logs {
-    /// (Re)open the log file in file mode. No-op in netidx mode.
+    /// (Re)open the log file in file mode, appending to any existing
+    /// contents. No-op in netidx mode.
     async fn open_files(&mut self) -> Result<()> {
         match self {
             Self::Netidx { .. } => Ok(()),
@@ -352,7 +353,7 @@ impl Logs {
                 *log_file = Some(
                     File::options()
                         .create(true)
-                        .write(true)
+                        .append(true)
                         .open(&log_path)
                         .await?,
                 );

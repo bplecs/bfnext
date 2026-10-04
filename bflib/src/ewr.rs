@@ -122,7 +122,7 @@ impl GibBraa {
             }
             EwrUnits::Imperial => {
                 self.range = self.range / 1852;
-                self.altitude = (self.altitude as f64 * 3.38084) as u32;
+                self.altitude = (self.altitude as f64 * 3.28084) as u32;
                 // Round speed to nearest 100s in imperial (kts)
                 self.speed = ((((self.speed as f64) * 1.94384) / 100.0).round() * 100.0) as u16;
                 // Round altitude: under 1000ft to nearest 100s, 1000ft+ to nearest 1000s

@@ -1097,7 +1097,8 @@ impl Db {
         let (oid, crate_cfg) = cargo.crates.pop().unwrap();
         let weight = cargo.weight();
         // on any failure below the crate is pushed back onboard
-        if st.in_air && st.speed > crate_cfg.max_drop_speed as f64 {
+        // st.speed is km/h, max_drop_speed is m/s
+        if st.in_air && st.speed > crate_cfg.max_drop_speed as f64 * 3.6 {
             let max_sp = (crate_cfg.max_drop_speed * 3600) / 1000;
             let max_al = crate_cfg.max_drop_height_agl;
             cargo.crates.push((oid, crate_cfg));

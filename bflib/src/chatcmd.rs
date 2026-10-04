@@ -355,6 +355,7 @@ fn delete_command(ctx: &mut Context, id: PlayerId, s: &str) {
                                         cost_fraction,
                                         &format_compact!("reclaimed {id}"),
                                     );
+                                    reply!("deleted {id}")
                                 }
                             },
                         }
@@ -646,7 +647,7 @@ fn jtac_command(ctx: &mut Context, id: PlayerId, s: &str) {
             ctx.db
                 .ephemeral
                 .msgs()
-                .send(MsgTyp::Chat(Some(id)), "invalid jtac id {jtid}");
+                .send(MsgTyp::Chat(Some(id)), format_compact!("invalid jtac id {jtid}"));
         }
     } else {
         ctx.db.ephemeral.msgs().send(
@@ -768,7 +769,7 @@ fn run_jtac_command(
                 ctx.db
                     .ephemeral
                     .msgs()
-                    .send(MsgTyp::Chat(Some(id)), "invalid laser code {s}");
+                    .send(MsgTyp::Chat(Some(id)), format_compact!("invalid laser code {s}"));
                 return Ok(());
             }
         };
@@ -788,7 +789,7 @@ fn run_jtac_command(
                     if aid == "all" {
                         SmallVec::from_iter(jtac.nearby_artillery().into_iter().copied())
                     } else {
-                        error!("invalid arty group id {id}")
+                        error!("invalid arty group id {aid}")
                     }
                 }
             };
